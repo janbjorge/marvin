@@ -18,59 +18,57 @@ Agent: → loads marvin
 
 ## Install
 
-marvin is a directory with `SKILL.md` plus `references/` and `assets/`. Copy it where the agent expects skills.
+marvin is packaged as a Claude Code plugin (`.claude-plugin/plugin.json` + `skills/marvin/`). Install via the marketplace, drop the skill directly, or reference `SKILL.md` from any agent's instruction file.
 
 ## Setup — Claude Code
 
-One step. Skills are loaded automatically from `~/.claude/skills/` (user-level) or `.claude/skills/` (project-level).
-
-**User-level (available in every project):**
+Two steps. Add the marketplace, install the plugin:
 
 ```bash
-git clone https://github.com/janbjorge/marvin.git ~/.claude/skills/marvin
+claude plugin marketplace add janbjorge/marvin
+claude plugin install marvin-skills@marvin
 ```
 
-**Project-level (only in this repo):**
+Verify with `claude plugin list` — `marvin-skills` should appear. Then `/skills` should list `marvin`. Trigger by asking for a *"Postgres health check"*, *"bloat audit"*, or *"why is my database slow"*.
+
+**Or, drop the skill directly without the plugin system:**
 
 ```bash
-git clone https://github.com/janbjorge/marvin.git .claude/skills/marvin
+git clone https://github.com/janbjorge/marvin.git /tmp/marvin
+cp -r /tmp/marvin/skills/marvin ~/.claude/skills/marvin   # user-level
+# or
+cp -r /tmp/marvin/skills/marvin .claude/skills/marvin     # project-level
 ```
-
-Verify with `/skills` — `marvin` should appear. Trigger by asking for a *"Postgres health check"*, *"bloat audit"*, or *"why is my database slow"*.
 
 > **Database connection.** marvin is instructions, not a client. The agent needs a Postgres channel — see [Database connection](#database-connection) below.
 
 ## Setup — Codex CLI
 
-Codex doesn't have a skill system, but `SKILL.md` is a self-contained instruction file the agent can read on demand. Two options:
-
-**Option A — Reference the file from `AGENTS.md`:**
+Codex doesn't have a skill system, but `SKILL.md` is a self-contained instruction file the agent can read on demand.
 
 ```bash
-git clone https://github.com/janbjorge/marvin.git ~/.codex/skills/marvin
+git clone https://github.com/janbjorge/marvin.git ~/.codex/marvin
 ```
 
 Add to your project's `AGENTS.md`:
 
 ```markdown
 For Postgres health, bloat, or performance questions, follow the procedure in
-~/.codex/skills/marvin/SKILL.md.
+~/.codex/marvin/skills/marvin/SKILL.md.
 ```
-
-**Option B — Inline the relevant phase.** Copy the section of `SKILL.md` you care about into `AGENTS.md` directly. Smaller context, less indirection.
 
 ## Setup — OpenCode
 
 OpenCode reads instruction files listed explicitly in `opencode.jsonc` ([OpenCode config docs](https://opencode.ai/docs/config/)).
 
 ```bash
-git clone https://github.com/janbjorge/marvin.git .opencode/skills/marvin
+git clone https://github.com/janbjorge/marvin.git .opencode/marvin
 ```
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "instructions": [".opencode/skills/marvin/SKILL.md"]
+  "instructions": [".opencode/marvin/skills/marvin/SKILL.md"]
 }
 ```
 
@@ -155,10 +153,10 @@ Every finding names its source view and column. Numbers are pasted from query ou
 The shipped scripts are runnable directly:
 
 ```bash
-psql -X -f assets/00-preflight-and-existential.sql -d "$DATABASE_URL"
-psql -X -f assets/03-vacuum-and-long-xacts.sql      -d "$DATABASE_URL"
-psql -X -f assets/04-locks-and-blocking.sql         -d "$DATABASE_URL"
-psql -X -f assets/06-index-health.sql               -d "$DATABASE_URL"
+psql -X -f skills/marvin/assets/00-preflight-and-existential.sql -d "$DATABASE_URL"
+psql -X -f skills/marvin/assets/03-vacuum-and-long-xacts.sql      -d "$DATABASE_URL"
+psql -X -f skills/marvin/assets/04-locks-and-blocking.sql         -d "$DATABASE_URL"
+psql -X -f skills/marvin/assets/06-index-health.sql               -d "$DATABASE_URL"
 ```
 
 Phases 2, 5, 7, 8, 9, 10 currently live inline in `SKILL.md`. For bloat estimation as a standalone script, use [pgexperts/pgsql-bloat-estimation](https://github.com/ioguix/pgsql-bloat-estimation).
@@ -167,18 +165,24 @@ Phases 2, 5, 7, 8, 9, 10 currently live inline in `SKILL.md`. For bloat estimati
 
 ```
 marvin/
-├── SKILL.md                       ← main workflow (read by the agent)
-├── README.md
-├── references/
-│   ├── version-compatibility.md   ← PG12–17 catalog/column matrix
-│   ├── bloat-detection.md         ← pgexperts queries + interpretation
-│   ├── interpretation-thresholds.md
-│   └── remediation-playbook.md    ← safe patterns w/ lock disclosure
-└── assets/
-    ├── 00-preflight-and-existential.sql
-    ├── 03-vacuum-and-long-xacts.sql
-    ├── 04-locks-and-blocking.sql
-    └── 06-index-health.sql
+├── .claude-plugin/
+│   ├── plugin.json                ← plugin manifest
+│   └── marketplace.json           ← marketplace manifest
+├── skills/
+│   └── marvin/
+│       ├── SKILL.md               ← main workflow (read by the agent)
+│       ├── references/
+│       │   ├── version-compatibility.md   ← PG12–17 catalog/column matrix
+│       │   ├── bloat-detection.md         ← pgexperts queries + interpretation
+│       │   ├── interpretation-thresholds.md
+│       │   └── remediation-playbook.md    ← safe patterns w/ lock disclosure
+│       └── assets/
+│           ├── 00-preflight-and-existential.sql
+│           ├── 03-vacuum-and-long-xacts.sql
+│           ├── 04-locks-and-blocking.sql
+│           └── 06-index-health.sql
+├── LICENSE
+└── README.md
 ```
 
 ## Limitations

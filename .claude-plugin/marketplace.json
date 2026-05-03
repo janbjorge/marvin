@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "marvin",
+  "description": "PostgreSQL health, bloat, and performance audit skill — packaged for Claude Code.",
+  "owner": {
+    "name": "Jan Bjorge",
+    "url": "https://github.com/janbjorge"
+  },
+  "plugins": [
+    {
+      "name": "marvin-skills",
+      "description": "Read-only PostgreSQL diagnostic skill covering wraparound risk, bloat (pgexperts math), vacuum lag, locks, slow queries, index health, replication, and configuration audit.",
+      "source": "./",
+      "category": "development"
+    }
+  ]
+}
