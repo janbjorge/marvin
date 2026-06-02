@@ -97,7 +97,10 @@ ORDER BY small.bytes DESC;
 -- ============================================================================
 -- 6d  Foreign keys without a supporting index.
 -- Common cause of slow cascade DELETEs and lock escalations on the parent
--- side. The index must lead with the FK columns in order.
+-- side. The index must lead with the FK columns in order. Only the leading
+-- key portion counts (indnkeyatts) — INCLUDE columns do not satisfy an FK
+-- lookup. indkey is int2vector (0-based); convert to a 1-based int[] for
+-- slicing so [1:N] returns N elements.
 -- ============================================================================
 SELECT
   c.conrelid::regclass                          AS table_name,
@@ -109,9 +112,16 @@ CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS x(attnum, ord)
 JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = x.attnum
 WHERE c.contype = 'f'
   AND NOT EXISTS (
-    SELECT 1 FROM pg_index i
+    SELECT 1
+    FROM pg_index i,
+         LATERAL (
+           SELECT (pg_catalog.string_to_array(
+                     pg_catalog.int2vectorout(i.indkey), ' '))::int[] AS k
+         ) AS conv
     WHERE i.indrelid = c.conrelid
-      AND (i.indkey::int[])[0:array_length(c.conkey,1)-1] = c.conkey::int[]
+      AND i.indislive
+      AND array_length(c.conkey, 1) <= i.indnkeyatts
+      AND conv.k[1:array_length(c.conkey, 1)] = c.conkey::int[]
   )
 GROUP BY c.oid, c.conrelid, c.conname
 ORDER BY pg_relation_size(c.conrelid) DESC;
