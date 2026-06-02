@@ -1,6 +1,6 @@
 {
   "name": "marvin-skills",
-  "description": "Senior-DBA-grade PostgreSQL audit skill: bloat, vacuum, locks, index health, wraparound risk. Read-only, version-aware (PG 12-17), self-protecting, catalog-cited.",
+  "description": "Senior-DBA-grade PostgreSQL audit skill: bloat (pgexperts math), vacuum, locks, index health, wraparound, slow queries, Azure Query Store. Read-only, catalog-cited, PG16+.",
   "author": {
     "name": "Jan Bjorge",
     "url": "https://github.com/janbjorge"
