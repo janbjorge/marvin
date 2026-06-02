@@ -1,16 +1,8 @@
--- marvin: 04-locks-and-blocking.sql
--- Phase 4 — blocked queries and lock distribution.
--- Read-only.
---
--- Execution model: labelled query catalogue for the pglens `query` MCP tool.
--- pglens also exposes a specialized `blocking_locks` tool — prefer it when
--- available; the queries below are the equivalent raw SQL.
-
+-- marvin: 04-locks-and-blocking.sql — Phase 4. Read-only.
+-- pglens `blocking_locks` tool covers this; use the raw SQL when absent.
 
 -- ============================================================================
--- 4a  Currently blocked queries.
--- A non-empty result is always at least MEDIUM; investigate the blocker
--- in 4b before suggesting any remediation.
+-- 4a  Blocked queries. Non-empty → MEDIUM+. Investigate 4b before remediating.
 -- ============================================================================
 SELECT
   blocked.pid                      AS blocked_pid,
@@ -27,7 +19,7 @@ ORDER BY waited DESC NULLS LAST;
 
 
 -- ============================================================================
--- 4b  The blockers (enriched).
+-- 4b  Blockers (enriched).
 -- ============================================================================
 SELECT pid, usename, application_name, state,
        wait_event_type, wait_event,
@@ -44,8 +36,7 @@ WHERE pid IN (
 
 
 -- ============================================================================
--- 4c  Lock distribution (look for unusual lock types).
--- AccessExclusiveLock outside DDL windows is suspicious.
+-- 4c  Lock distribution. AccessExclusiveLock outside DDL window = suspicious.
 -- ============================================================================
 SELECT mode, locktype, count(*) AS held
 FROM pg_locks

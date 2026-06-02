@@ -1,26 +1,12 @@
--- marvin: 02-bloat-pgexperts.sql
--- Phase 2 — statistics-based table and B-tree index bloat (pgexperts math).
--- Read-only. Catalog scan only; no row locks.
+-- marvin: 02-bloat-pgexperts.sql — Phase 2. Catalog-only, no row locks.
 -- Source: https://github.com/ioguix/pgsql-bloat-estimation (BSD).
---
--- Execution model: each "-- ===" block below is one query the agent runs
--- via the pglens `query` MCP tool. Not a psql script.
---
--- Why this, not n_dead_tup ratio:
---   n_dead_tup / (n_live_tup + n_dead_tup) measures *unvacuumed* dead tuples.
---   Once vacuum runs, n_dead_tup drops but the relation file is still bloated
---   (VACUUM marks pages reusable; it does not return them to the OS). This
---   estimate computes expected size from pg_class.reltuples + pg_statistic
---   column widths + fillfactor + page overhead and compares to actual pages.
-
+-- Pgexperts math compares actual pages against expected pages computed from
+-- reltuples + pg_statistic widths + fillfactor + page overhead. n_dead_tup
+-- ratio is vacuum lag, NOT bloat — see references/interpretation-thresholds.md.
 
 -- ============================================================================
--- 2a  Table bloat estimate (pgexperts, > 100 MB only).
--- bloat_size = bytes wasted accounting for fillfactor.
--- bloat_pct  = same as percentage.
--- is_na      = estimate unreliable (skip the row).
--- Cross-check last_analyze on flagged rows (see 2a-stats below) — stale
--- statistics produce unreliable estimates.
+-- 2a  Table bloat (> 100 MB). is_na = skip the row.
+-- Cross-check last_analyze (2a-stats below) — stale stats → unreliable.
 -- ============================================================================
 SELECT
   current_database()                                            AS db,
@@ -92,8 +78,7 @@ LIMIT 25;
 
 
 -- ============================================================================
--- 2a-stats  Cross-check statistics freshness for the top tables.
--- Stale stats → the estimate above is unreliable. Recommend ANALYZE.
+-- 2a-stats  Stats freshness for the top tables. Stale → recommend ANALYZE.
 -- ============================================================================
 SELECT
   schemaname, relname,
@@ -107,8 +92,7 @@ LIMIT 25;
 
 
 -- ============================================================================
--- 2b  B-tree index bloat estimate (pgexperts, > 50 MB only).
--- GIN / GiST / BRIN / HASH / SP-GiST not covered — math differs.
+-- 2b  B-tree index bloat (> 50 MB). GIN/GiST/BRIN/HASH/SP-GiST not covered.
 -- ============================================================================
 SELECT
   current_database()                                                   AS db,
@@ -196,10 +180,8 @@ LIMIT 25;
 
 
 -- ============================================================================
--- 2c  pgstattuple extension present? (for exact per-table follow-up).
--- If present and the estimate is borderline on a flagged table, the agent
--- proposes (does NOT auto-run) one of:
---   SELECT * FROM pgstattuple_approx('schema.table');   -- sampled, faster
+-- 2c  pgstattuple present? Borderline rows → propose (do not run):
+--   SELECT * FROM pgstattuple_approx('schema.table');   -- sampled
 --   SELECT * FROM pgstattuple('schema.table');          -- full scan + share lock
 -- ============================================================================
 SELECT extname, extversion

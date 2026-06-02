@@ -1,39 +1,13 @@
--- marvin: 05a-azure-query-store.sql
--- Phase 5a — Azure Database for PostgreSQL Flexible Server: Query Store hotspots.
--- Read-only.
---
--- Execution model: labelled query catalogue for the pglens `query` MCP tool.
--- Not a psql script.
---
--- CRITICAL connection note:
---   query_store.* views live only in the `azure_sys` database. The agent
---   must instruct the user to point pglens at a connection whose PGDATABASE
---   is `azure_sys` before running 5a-1 onward. 5a-0 below confirms this.
---
--- Why this exists in addition to Phase 5 (pg_stat_statements):
---   pg_stat_statements is cumulative since last reset → no time bucketing.
---   Query Store aggregates over fixed windows (default 15 min,
---   pg_qs.interval_length_minutes) and retains for
---   pg_qs.retention_period_in_days (default 7). That gives "what was slow
---   between 14:00 and 14:15 yesterday" without rotating snapshots yourself.
---   query_store.pgms_wait_sampling_view also gives per-query wait events,
---   which pg_stat_statements does NOT.
---
--- Reference:
---   https://learn.microsoft.com/en-us/azure/postgresql/monitor/concepts-query-performance-insight
---   https://learn.microsoft.com/en-us/azure/postgresql/flexible-server/concepts-query-store
---
--- Limitations (per MS docs):
---   - Not available on read replicas.
---   - Burstable pricing tier: do NOT enable Query Store (performance impact).
---   - Server-wide on/off; cannot enable per-database.
---   - When default_transaction_read_only = on (or storage-full read-only),
---     Query Store stops capturing — analysis still works on retained data.
-
+-- marvin: 05a-azure-query-store.sql — Phase 5a. Read-only.
+-- query_store.* lives ONLY in the azure_sys database — reconnect pglens
+-- with PGDATABASE=azure_sys before running 5a-1+. 5a-0 confirms.
+-- Adds time-bucketing (default 15 min, 7-day retention) and per-query waits
+-- that pg_stat_statements cannot capture.
+-- Not on read replicas. Do not enable on Burstable tier.
+-- Docs: https://learn.microsoft.com/en-us/azure/postgresql/monitor/concepts-query-performance-insight
 
 -- ============================================================================
--- 5a-0  Azure Flexible Server detection + connection check.
--- The agent reads these flags to decide whether to run the rest of 5a.
+-- 5a-0  Detection + connection check.
 -- ============================================================================
 SELECT
   current_database()                                              AS connected_db,
@@ -44,11 +18,10 @@ SELECT
 
 
 -- ============================================================================
--- 5a-params  Server parameters controlling Query Store + wait sampling.
--- Required values for full hotspot analysis:
---   pg_qs.query_capture_mode              = 'top' or 'all'  (default 'none' = OFF)
---   pgms_wait_sampling.query_capture_mode = 'all'           (required for waits)
---   track_io_timing                       = on              (required for io_ms)
+-- 5a-params  Server parameters. Required:
+--   pg_qs.query_capture_mode              = 'top' | 'all'   (default 'none' = off)
+--   pgms_wait_sampling.query_capture_mode = 'all'           (for waits)
+--   track_io_timing                       = on              (for io_ms)
 -- ============================================================================
 SELECT name, setting, unit, source, short_desc
 FROM pg_settings
@@ -69,9 +42,7 @@ ORDER BY name;
 
 
 -- ============================================================================
--- 5a-1  Captured-data freshness — do we have anything to analyse?
--- staleness > pg_qs.interval_length_minutes is normal (the current window
--- hasn't been flushed yet). staleness > a few intervals → capture has stopped.
+-- 5a-1  Captured-data freshness. staleness > a few intervals → capture stopped.
 -- ============================================================================
 SELECT
   min(start_time)                AS earliest_window,
@@ -84,9 +55,7 @@ FROM query_store.qs_view;
 
 
 -- ============================================================================
--- 5a-2  Top queries by total time (last 24h).
--- Aggregates across all 15-min windows. Excludes the azuresu control-plane
--- user (is_system_query = true).
+-- 5a-2  Top by total time (last 24h). Excludes is_system_query.
 -- ============================================================================
 SELECT
   q.query_id,
@@ -110,8 +79,7 @@ LIMIT 15;
 
 
 -- ============================================================================
--- 5a-3  Top queries by disk I/O (last 24h).
--- blk_read_time / blk_write_time populated only when track_io_timing = on.
+-- 5a-3  Top by disk I/O (last 24h). Needs track_io_timing = on.
 -- ============================================================================
 SELECT
   q.query_id,
@@ -137,8 +105,7 @@ LIMIT 15;
 
 
 -- ============================================================================
--- 5a-4  Top queries by temp-file usage (last 24h).
--- work_mem too small, or a missing index forcing a full sort/hash.
+-- 5a-4  Top by temp-file usage (last 24h).
 -- ============================================================================
 SELECT
   q.query_id,
@@ -160,9 +127,8 @@ LIMIT 15;
 
 
 -- ============================================================================
--- 5a-5  Top queries by call volume (last 24h).
--- High calls + small mean_ms = chatty workload (candidate for batching
--- or prepared-statement reuse). Multiplies per-call overhead.
+-- 5a-5  Top by call volume (last 24h). High calls + small mean = chatty;
+-- batching / prepared-statement reuse candidate.
 -- ============================================================================
 SELECT
   q.query_id,
@@ -181,9 +147,8 @@ LIMIT 15;
 
 
 -- ============================================================================
--- 5a-6  Plan instability across windows (last 24h).
--- Compares mean_time across 15-min buckets for the same query_id.
--- bucket_coeff_var = stddev / mean over the buckets — flips, sensitivity.
+-- 5a-6  Plan instability across 15-min buckets (last 24h).
+-- bucket_coeff_var = stddev/mean over buckets.
 -- ============================================================================
 WITH per_window AS (
   SELECT query_id, db_id, start_time, mean_time, stddev_time, calls,
@@ -214,10 +179,7 @@ LIMIT 15;
 
 
 -- ============================================================================
--- 5a-7  Wait events per query (last 24h).
--- Populated only when pgms_wait_sampling.query_capture_mode = 'all'.
--- event_type buckets: IO, LWLock, Lock, Client, IPC, Timeout, BufferPin,
--- Extension, Activity. See pg_stat_activity docs for the canonical list.
+-- 5a-7  Wait events per query (last 24h). Needs pgms_wait_sampling = 'all'.
 -- ============================================================================
 SELECT
   w.query_id,
@@ -235,7 +197,6 @@ LIMIT 30;
 
 -- ============================================================================
 -- 5a-8  Top wait events overall (last 24h).
--- Quick "what is the cluster waiting on" rollup.
 -- ============================================================================
 SELECT
   event_type,

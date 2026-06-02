@@ -1,35 +1,8 @@
--- marvin: 05-workload-hotspots.sql
--- Phase 5 — workload hotspots: where the load is and why it hurts.
--- Read-only. Catalog views only.
--- Target: PostgreSQL 16+.
---
--- Execution model: each "-- ===" block below is one query the agent
--- runs via the pglens `query` MCP tool. Not a psql script — no \echo,
--- no \if, no \gset. Single statements per block, agent picks blocks based
--- on the preflight flags (00-preflight.sql).
---
--- Order of operations:
---   5-0  Preflight: capture version flags + track_io_timing.
---   5-1  pg_stat_statements extension check.
---   5-2  pg_stat_statements_info freshness.
---   5a   Top by total exec time (plan + exec).
---   5b   Top by disk I/O.
---   5b2  Top WAL producers.
---   5c   Top temp-file writers.
---   5d   Plan instability.
---   5e   Unbounded result sets.
---   5f   Sequential-scan-dominated tables.
---   5f2  Last seq/idx scan timestamps.
---   5g   HOT update efficiency.
---   5h   Per-table cache hit ratio.
---   5i   pg_stat_io I/O attribution.
---   5j   Live wait-event distribution.
---
--- Severity rules live in SKILL.md Section D.
-
+-- marvin: 05-workload-hotspots.sql — Phase 5. PG16+. Read-only.
+-- Severity rubric in SKILL.md §D. Agent picks 5b [PG16] vs [PG17+] via pg17_plus.
 
 -- ============================================================================
--- 5-0  Preflight: capture version + I/O timing flag.
+-- 5-0  Preflight: version + track_io_timing.
 -- ============================================================================
 SELECT
   current_setting('server_version_num')::int       AS pg_ver,
@@ -38,8 +11,7 @@ SELECT
 
 
 -- ============================================================================
--- 5-1  pg_stat_statements present?
--- If empty result → recommend the extension; skip 5a-5e + 5b2.
+-- 5-1  pg_stat_statements present? Empty → skip 5a–5e + 5b2.
 -- ============================================================================
 SELECT extname, extversion
 FROM pg_extension
@@ -47,17 +19,14 @@ WHERE extname = 'pg_stat_statements';
 
 
 -- ============================================================================
--- 5-2  Cumulative-stats freshness.
--- Interpret 5a-5e in light of the reported stats_age.
+-- 5-2  pg_stat_statements freshness. Interpret 5a–5e against stats_age.
 -- ============================================================================
 SELECT stats_reset, now() - stats_reset AS stats_age
 FROM pg_stat_statements_info;
 
 
 -- ============================================================================
--- 5a  Top by total time (plan + exec) — where time is spent.
--- pct_total >= 25 → biggest single tuning win.
--- mean_ms  > 1000 with calls > 100 → per-call pain.
+-- 5a  Top by total time (plan + exec). pct_total >= 25 → biggest single win.
 -- ============================================================================
 SELECT
   round((total_plan_time + total_exec_time)::numeric, 0)              AS total_ms,
@@ -78,9 +47,8 @@ LIMIT 15;
 
 
 -- ============================================================================
--- 5b [PG16]  Top by disk I/O (cache misses + I/O time).
--- PG16 still has the unsplit blk_read_time / blk_write_time columns.
--- io_ms is meaningful only when track_io_timing = on (see 5-0).
+-- 5b [PG16]  Top by disk I/O. Unsplit blk_*_time columns.
+-- io_ms meaningful only when track_io_timing = on.
 -- ============================================================================
 SELECT
   round((blk_read_time + blk_write_time)::numeric, 0) AS io_ms,
@@ -103,9 +71,8 @@ LIMIT 15;
 
 
 -- ============================================================================
--- 5b [PG17+]  Top by disk I/O — PG17 split blk_*_time into shared / local /
--- temp variants. The old blk_read_time / blk_write_time columns were removed.
--- Use this block when pg17_plus = true.
+-- 5b [PG17+]  Top by disk I/O. PG17 split blk_*_time → shared/local/temp;
+-- old columns removed. Use when pg17_plus = true.
 -- ============================================================================
 SELECT
   round((shared_blk_read_time + shared_blk_write_time)::numeric, 0) AS io_ms,
@@ -128,9 +95,8 @@ LIMIT 15;
 
 
 -- ============================================================================
--- 5b2  Top WAL producers (write amplification).
--- High wal_bytes/call = wide UPDATEs, non-HOT updates churning indexes
--- (see 5g), or write-heavy DML the workload may not realise is expensive.
+-- 5b2  Top WAL producers. High wal_bytes/call → wide UPDATEs or non-HOT
+-- index churn (5g).
 -- ============================================================================
 SELECT
   pg_size_pretty(wal_bytes)                          AS wal_size,
@@ -147,9 +113,7 @@ LIMIT 15;
 
 
 -- ============================================================================
--- 5c  Top temp-file writers (sort / hash spill).
--- Heavy temp_blks_written → work_mem too low for this query, or a missing
--- index forces a full sort/hash.
+-- 5c  Top temp-file writers. work_mem too low or missing index for sort/hash.
 -- ============================================================================
 SELECT
   temp_blks_written,
@@ -165,9 +129,8 @@ LIMIT 15;
 
 
 -- ============================================================================
--- 5d  Plan instability (stddev / mean variance).
--- coeff_var > 1 with calls > 100 = plan flips, parameter sensitivity,
--- or cache-warm vs cache-cold variance. Pair with auto_explain.
+-- 5d  Plan instability. coeff_var > 1 + calls > 100 = plan flips / param
+-- sensitivity / cache variance. Pair with auto_explain.
 -- ============================================================================
 SELECT
   calls,
@@ -185,9 +148,7 @@ LIMIT 15;
 
 
 -- ============================================================================
--- 5e  Unbounded result sets (rows per call).
--- High rows/call on user-facing queries usually means missing LIMIT,
--- bad pagination, or N+1 fan-out.
+-- 5e  Rows per call. High → missing LIMIT, bad pagination, N+1 fan-out.
 -- ============================================================================
 SELECT
   calls,
@@ -201,8 +162,7 @@ LIMIT 15;
 
 
 -- ============================================================================
--- 5f  Sequential-scan-dominated tables.
--- seq_pct > 80 on a > 100 MB table → missing or unused index.
+-- 5f  Seq-scan-dominated tables. seq_pct > 80 on > 100 MB → missing index.
 -- ============================================================================
 SELECT
   schemaname, relname,
@@ -227,8 +187,7 @@ LIMIT 15;
 
 
 -- ============================================================================
--- 5f2  Last seq/idx scan timestamps.
--- Survives stats resets — tells you *when* the last scan happened.
+-- 5f2  Last seq/idx scan timestamps (survive stats resets).
 -- ============================================================================
 SELECT
   schemaname, relname,
@@ -244,13 +203,10 @@ LIMIT 15;
 
 
 -- ============================================================================
--- 5g  HOT update efficiency.
--- hot_pct < 50 on a heavy-update table = index churn on every UPDATE,
--- write amplification, faster bloat growth. Candidates: lower fillfactor
--- or drop the indexed column from the UPDATE.
--- n_tup_newpage_upd reports updates that placed the new row on a NEW page
--- (no room on the original) — non-HOT and non-cold; useful to distinguish
--- from cold updates (different page reachable via index).
+-- 5g  HOT update efficiency. hot_pct < 50 + heavy updates = index churn,
+-- write amplification, faster bloat. Lower fillfactor or stop updating the
+-- indexed column. n_tup_newpage_upd = row placed on new page (non-HOT,
+-- non-cold) — distinguishes from cold updates reachable via index.
 -- ============================================================================
 SELECT
   schemaname, relname,
@@ -269,10 +225,8 @@ LIMIT 15;
 
 
 -- ============================================================================
--- 5h  Per-table cache hit ratio (heap).
--- Filtered to "actually busy" (>= 10k buffer touches).
--- Low hit_pct + large size → working set exceeds shared_buffers for that
--- relation. For better attribution see 5i (pg_stat_io).
+-- 5h  Per-table heap cache hit (>= 10k touches). Low + large → working set
+-- > shared_buffers. Better attribution: 5i.
 -- ============================================================================
 SELECT
   schemaname, relname,
@@ -291,10 +245,7 @@ LIMIT 15;
 
 
 -- ============================================================================
--- 5i  pg_stat_io — I/O attribution by backend type + context.
--- Tells you who is doing the I/O (client backend / autovacuum /
--- checkpointer / bgwriter / walwriter) and in what context (normal /
--- vacuum / bulkread / bulkwrite).
+-- 5i  pg_stat_io — I/O by backend type + context (normal/vacuum/bulk*).
 -- ============================================================================
 SELECT
   backend_type, object, context,
@@ -306,17 +257,9 @@ LIMIT 30;
 
 
 -- ============================================================================
--- 5j  Live wait-event distribution (single snapshot).
--- For a proper distribution install pg_wait_sampling, or sample this
--- query every second for a minute. wait_event_type tells you the
--- bottleneck class:
---   NULL     → on-CPU (no wait)
---   IO       → disk pressure
---   LWLock   → buffer mapping, WAL insert, lock manager contention
---   Lock     → row/table lock waits → see Phase 4
---   Client   → app/network slow to consume results
---   IPC      → parallel worker coordination
---   Timeout  → vacuum_cost_delay, statement_timeout, etc.
+-- 5j  Wait events (single snapshot). Sustained → install pg_wait_sampling
+-- or sample every 1s for a minute. wait_event_type: NULL=on-CPU, IO=disk,
+-- LWLock=buffer/WAL/lock-manager, Lock→Phase 4, Client/IPC/Timeout.
 -- ============================================================================
 SELECT
   COALESCE(wait_event_type, '(running on CPU)') AS wait_event_type,
@@ -331,7 +274,7 @@ ORDER BY count(*) DESC;
 
 
 -- ============================================================================
--- 5j2  Sustained wait-event sampling extension present?
+-- 5j2  pg_wait_sampling present?
 -- ============================================================================
 SELECT extname, extversion
 FROM pg_extension

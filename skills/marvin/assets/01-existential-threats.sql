@@ -1,19 +1,11 @@
--- marvin: 01-existential-threats.sql
--- Phase 1 — things that can take the database offline. Surface immediately,
--- before continuing the rest of the audit.
--- Read-only.
---
--- Execution model: labelled query catalogue for the pglens `query` MCP tool.
--- Not a psql script.
-
+-- marvin: 01-existential-threats.sql — Phase 1. Read-only.
+-- Halt the audit on any CRITICAL row.
 
 -- ============================================================================
--- 1a  Transaction ID wraparound risk (per database).
--- pct_to_emergency_av >= 90  → HIGH    (anti-wraparound AV will start soon)
--- pct_to_emergency_av >= 100 → CRITICAL (already in anti-wraparound mode)
--- MultiXact wraparound is a separate clock and has its own counter — both
--- are reported below. Workloads using SELECT FOR SHARE / FK validation can
--- hit MultiXact wraparound before xid wraparound.
+-- 1a  Wraparound risk (xid + MultiXact, per database).
+-- pct_to_emergency_av >= 90 → HIGH; >= 100 → CRITICAL (anti-wraparound running).
+-- MultiXact wraparound is a separate counter — FK / FOR SHARE workloads can
+-- hit it first.
 -- ============================================================================
 SELECT
   datname,
@@ -31,9 +23,8 @@ ORDER BY age(datfrozenxid) DESC;
 
 
 -- ============================================================================
--- 1a-per-table  Per-table wraparound risk (tables > 50% of freeze_max_age).
--- Identifies which relations to target with VACUUM (FREEZE) in a fire drill,
--- largest + oldest first.
+-- 1a-per-table  Per-table wraparound (> 50% of freeze_max_age).
+-- Targets for VACUUM (FREEZE) in a fire drill — largest + oldest first.
 -- ============================================================================
 SELECT
   c.oid::regclass                            AS relation,
@@ -54,9 +45,8 @@ LIMIT 30;
 
 -- ============================================================================
 -- 1b  Replication slot bloat.
--- Inactive slots with retained WAL > 10 GB → HIGH.
--- wal_status of 'extended' or 'lost' → CRITICAL — replica cannot catch up
--- without a fresh basebackup.
+-- Inactive + retained WAL > 10 GB → HIGH. wal_status 'extended'/'lost' →
+-- CRITICAL (replica can't catch up without fresh basebackup).
 -- ============================================================================
 SELECT
   slot_name, plugin, slot_type, database,
@@ -77,10 +67,7 @@ ORDER BY
 
 
 -- ============================================================================
--- 1c  WAL volume on disk.
--- Postgres only knows what it has written; actual filesystem free space
--- requires OS tooling. Use this number against max_wal_size + the slot
--- retention above to estimate disk pressure.
+-- 1c  WAL volume on disk (pair with max_wal_size + slot retention above).
 -- ============================================================================
 SELECT
   pg_size_pretty(sum(size))     AS total_wal_dir_size,

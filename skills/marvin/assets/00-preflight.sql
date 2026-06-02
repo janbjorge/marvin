@@ -1,20 +1,10 @@
--- marvin: 00-preflight.sql
--- Phase 0 — context. Capture environment facts the rest of the audit
--- branches on (PG major, replica status, DB size, stats freshness, extensions).
--- Read-only.
---
--- Execution model: labelled query catalogue for the pglens `query` MCP tool.
--- Not a psql script. Existential-threat checks (wraparound, slot bloat, WAL)
--- live in 01-existential-threats.sql so Phase 0 stays pure context.
-
+-- marvin: 00-preflight.sql — Phase 0 context. Read-only.
+-- Existential threats (wraparound, slot bloat, WAL) live in 01.
 
 -- ============================================================================
--- 0-version  PostgreSQL major version, recovery status, uptime.
--- Marvin requires PG16+. pg17_plus drives the one remaining branch
--- (pg_stat_checkpointer was split out of pg_stat_bgwriter in PG17).
--- If pg_ver < 160000 the audit should refuse to run and tell the user.
--- pg_is_in_recovery = true means standby/replica — no VACUUM, no DDL
--- recommendations should fire against this node.
+-- 0-version  PG version, replica status, uptime.
+-- pg16_plus is the floor (abort if false). pg17_plus drives 5b variant.
+-- is_replica → no VACUUM / DDL / pg_terminate_backend recommendations.
 -- ============================================================================
 SELECT
   version()                                              AS postgres_version,
@@ -28,7 +18,7 @@ SELECT
 
 
 -- ============================================================================
--- 0-sizes  Database sizes (cluster-wide).
+-- 0-sizes  Database sizes.
 -- ============================================================================
 SELECT datname, pg_size_pretty(pg_database_size(oid)) AS size
 FROM pg_database
@@ -37,9 +27,7 @@ ORDER BY pg_database_size(oid) DESC;
 
 
 -- ============================================================================
--- 0-stats-age  Stats freshness for the connected database.
--- Low confidence in unused-index and pg_stat_statements findings when this
--- is recent (< 7 days). Surface it as a caveat in the report, do not hide.
+-- 0-stats-age  Stats freshness. < 7 days = lower confidence on Phase 5 + 6.
 -- ============================================================================
 SELECT datname, stats_reset, now() - stats_reset AS stats_age
 FROM pg_stat_database
@@ -47,18 +35,7 @@ WHERE datname = current_database();
 
 
 -- ============================================================================
--- 0-extensions  Which audit-relevant extensions are present?
--- Drives later phases:
---   pg_stat_statements  — Phase 5 hotspots
---   pgstattuple         — Phase 2 exact bloat fallback
---   pg_repack           — Remediation choice in the playbook
---   pg_buffercache      — Per-relation buffer attribution
---   auto_explain        — Plan capture for flagged queries
---   pg_wait_sampling    — Sustained wait-event distribution
---   pg_stat_kcache      — OS-level CPU / I/O per query
---   pg_prewarm          — Warm-cache restoration
---   pg_visibility       — Visibility map inspection
---   pg_freespacemap     — FSM inspection
+-- 0-extensions  Audit-relevant extensions.
 -- ============================================================================
 SELECT extname, extversion
 FROM pg_extension
@@ -71,7 +48,7 @@ ORDER BY extname;
 
 
 -- ============================================================================
--- 0-key-settings  Tuning parameters the audit interprets.
+-- 0-key-settings  Tuning parameters the audit reads.
 -- ============================================================================
 SELECT name, setting, unit
 FROM pg_settings

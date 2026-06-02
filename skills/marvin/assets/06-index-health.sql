@@ -1,22 +1,11 @@
--- marvin: 06-index-health.sql
--- Phase 6 — unused, duplicate/redundant, missing-FK, and invalid indexes.
--- Read-only.
---
--- Execution model: labelled query catalogue for the pglens `query` MCP tool.
--- pglens also exposes a specialized `unused_indexes` tool — prefer it when
--- available; 6a below is the equivalent raw SQL with the safety filters
--- (excludes unique, primary-key, and constraint-backing indexes).
-
+-- marvin: 06-index-health.sql — Phase 6. Read-only.
+-- Prefer pglens `unused_indexes` tool when available; 6a is the raw SQL with
+-- the same safety filters (excludes unique / PK / constraint-backing).
 
 -- ============================================================================
--- 6a  Unused indexes.
--- Caveats:
---   - stats_reset must be > 7d ago for this to be trustworthy.
---   - On PG16+ pg_stat_user_indexes also has last_idx_scan (timestamp survives
---     stats resets) — Marvin queries that via raw `query` when needed.
---   - Per-replica stats vary; check the right replica.
---   - Partial / quarterly-used indexes may show idx_scan = 0.
---   - FK-supporting and constraint-backing indexes are filtered out.
+-- 6a  Unused indexes. Trust requires stats_reset > 7d. Per-replica stats vary.
+-- Partial / quarterly-used indexes may show idx_scan = 0 — cross-check
+-- last_idx_scan (PG16+ timestamp survives stats resets).
 -- ============================================================================
 SELECT
   s.schemaname, s.relname           AS table_name,
@@ -36,7 +25,7 @@ ORDER BY pg_relation_size(s.indexrelid) DESC;
 
 
 -- ============================================================================
--- 6b  Duplicate indexes (same definition).
+-- 6b  Duplicate indexes (identical definition).
 -- ============================================================================
 WITH idx AS (
   SELECT
@@ -60,12 +49,10 @@ ORDER BY sum(bytes) DESC;
 
 
 -- ============================================================================
--- 6c  Prefix-redundant indexes.
--- (a) is redundant if (a,b) exists with the same predicate and opclasses.
--- Unique indexes are excluded — uniqueness can be a one-column property.
--- Slice indkey at indnkeyatts to exclude INCLUDE (covering) columns —
--- an INCLUDE column does not make an index redundant for key-search use.
--- indkey is an int2vector (0-based); convert to a 1-based int[] for slicing.
+-- 6c  Prefix-redundant: (a) is redundant if (a,b) exists with same predicate
+-- + opclasses. Unique excluded (uniqueness can be a 1-col property). Slice
+-- at indnkeyatts to drop INCLUDE columns (don't satisfy key-search). indkey
+-- is int2vector (0-based) — convert to 1-based int[] for SQL slicing.
 -- ============================================================================
 WITH idx AS (
   SELECT
@@ -108,12 +95,9 @@ ORDER BY small.bytes DESC;
 
 
 -- ============================================================================
--- 6d  Foreign keys without a supporting index.
--- Common cause of slow cascade DELETEs and lock escalations on the parent
--- side. The index must lead with the FK columns in order. Only the leading
--- key portion counts (indnkeyatts) — INCLUDE columns do not satisfy an FK
--- lookup. indkey is int2vector (0-based); convert to a 1-based int[] for
--- slicing so [1:N] returns N elements.
+-- 6d  FKs without a supporting index. Cause of slow cascade DELETEs / parent
+-- lock escalation. Index must lead with the FK columns; INCLUDE doesn't
+-- count (use indnkeyatts). int2vector → 1-based int[] so [1:N] yields N.
 -- ============================================================================
 SELECT
   c.conrelid::regclass                          AS table_name,
@@ -141,9 +125,8 @@ ORDER BY pg_relation_size(c.conrelid) DESC;
 
 
 -- ============================================================================
--- 6e  Invalid indexes (failed CREATE INDEX CONCURRENTLY).
--- These still consume disk and are updated by writes, but ignored by the
--- planner. Drop or rebuild.
+-- 6e  Invalid indexes (failed CREATE INDEX CONCURRENTLY). Cost writes for
+-- zero benefit (planner ignores). Drop or rebuild.
 -- ============================================================================
 SELECT i.indexrelid::regclass                            AS index_name,
        i.indrelid::regclass                              AS table_name,
