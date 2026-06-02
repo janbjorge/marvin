@@ -1,29 +1,29 @@
--- postgres-health-review: 06-index-health.sql
+-- marvin: 06-index-health.sql
 -- Phase 6 — unused, duplicate/redundant, missing-FK, and invalid indexes.
 -- Read-only.
+--
+-- Execution model: labelled query catalogue for the pglens `query` MCP tool.
+-- pglens also exposes a specialized `unused_indexes` tool — prefer it when
+-- available; 6a below is the equivalent raw SQL with the safety filters
+-- (excludes unique, primary-key, and constraint-backing indexes).
 
-\set QUIET on
-\pset pager off
 
-SET application_name = 'health-review';
-SET statement_timeout = '30s';
-SET lock_timeout = '2s';
-SET default_transaction_read_only = on;
-
-\echo
-\echo '================================================================'
-\echo ' PHASE 6a — Unused indexes'
-\echo '================================================================'
-\echo '   Caveats: stats_reset must be > 7d ago; per-replica stats vary;'
-\echo '   partial indexes may be used quarterly; FK-supporting indexes excluded.'
-\echo
-
+-- ============================================================================
+-- 6a  Unused indexes.
+-- Caveats:
+--   - stats_reset must be > 7d ago for this to be trustworthy.
+--   - On PG16+ pg_stat_user_indexes also has last_idx_scan (timestamp survives
+--     stats resets) — Marvin queries that via raw `query` when needed.
+--   - Per-replica stats vary; check the right replica.
+--   - Partial / quarterly-used indexes may show idx_scan = 0.
+--   - FK-supporting and constraint-backing indexes are filtered out.
+-- ============================================================================
 SELECT
-  s.schemaname, s.relname AS table_name,
-  s.indexrelname AS index_name,
+  s.schemaname, s.relname           AS table_name,
+  s.indexrelname                    AS index_name,
   s.idx_scan,
   pg_size_pretty(pg_relation_size(s.indexrelid)) AS index_size,
-  pg_size_pretty(pg_relation_size(s.relid)) AS table_size
+  pg_size_pretty(pg_relation_size(s.relid))      AS table_size
 FROM pg_stat_user_indexes s
 JOIN pg_index i ON s.indexrelid = i.indexrelid
 WHERE s.idx_scan = 0
@@ -34,46 +34,43 @@ WHERE s.idx_scan = 0
   )
 ORDER BY pg_relation_size(s.indexrelid) DESC;
 
-\echo
-\echo '================================================================'
-\echo ' PHASE 6b — Duplicate indexes (same definition)'
-\echo '================================================================'
-\echo
 
+-- ============================================================================
+-- 6b  Duplicate indexes (same definition).
+-- ============================================================================
 WITH idx AS (
   SELECT
-    indexrelid::regclass AS idx_name,
-    indrelid::regclass AS table_name,
-    pg_relation_size(indexrelid) AS bytes,
+    indexrelid::regclass                  AS idx_name,
+    indrelid::regclass                    AS table_name,
+    pg_relation_size(indexrelid)          AS bytes,
     indrelid, indkey, indclass, indoption,
-    COALESCE(indexprs::text, '') AS expr,
-    COALESCE(indpred::text, '')  AS pred
+    COALESCE(indexprs::text, '')          AS expr,
+    COALESCE(indpred::text, '')           AS pred
   FROM pg_index
   WHERE indislive
 )
 SELECT
   table_name,
-  pg_size_pretty(sum(bytes)::bigint) AS combined_size,
-  array_agg(idx_name ORDER BY idx_name) AS indexes
+  pg_size_pretty(sum(bytes)::bigint)                  AS combined_size,
+  array_agg(idx_name ORDER BY idx_name)               AS indexes
 FROM idx
 GROUP BY table_name, indrelid, indkey, indclass, indoption, expr, pred
 HAVING count(*) > 1
 ORDER BY sum(bytes) DESC;
 
-\echo
-\echo '================================================================'
-\echo ' PHASE 6c — Prefix-redundant indexes'
-\echo '================================================================'
-\echo '   (a) is redundant if (a,b) exists with same predicate & opclass'
-\echo
 
+-- ============================================================================
+-- 6c  Prefix-redundant indexes.
+-- (a) is redundant if (a,b) exists with the same predicate and opclasses.
+-- Unique indexes are excluded — uniqueness can be a one-column property.
+-- ============================================================================
 WITH idx AS (
   SELECT
-    indexrelid::regclass AS idx_name,
-    indrelid AS table_oid,
-    indrelid::regclass AS table_name,
-    indkey::int[] AS keycols,
-    indclass::oid[] AS keyops,
+    indexrelid::regclass    AS idx_name,
+    indrelid                AS table_oid,
+    indrelid::regclass      AS table_name,
+    indkey::int[]           AS keycols,
+    indclass::oid[]         AS keyops,
     pg_relation_size(indexrelid) AS bytes,
     COALESCE(indpred::text,'') AS pred,
     indisunique
@@ -82,32 +79,31 @@ WITH idx AS (
 )
 SELECT
   small.table_name,
-  small.idx_name AS redundant_index,
-  big.idx_name   AS covered_by,
+  small.idx_name             AS redundant_index,
+  big.idx_name               AS covered_by,
   pg_size_pretty(small.bytes) AS reclaimable
 FROM idx small
 JOIN idx big
   ON small.table_oid = big.table_oid
  AND small.idx_name <> big.idx_name
- AND small.pred = big.pred
+ AND small.pred     = big.pred
  AND NOT small.indisunique
  AND array_length(small.keycols, 1) <= array_length(big.keycols, 1)
- AND small.keycols = big.keycols[1:array_length(small.keycols,1)]
- AND small.keyops  = big.keyops[1:array_length(small.keycols,1)]
+ AND small.keycols  = big.keycols[1:array_length(small.keycols,1)]
+ AND small.keyops   = big.keyops[1:array_length(small.keycols,1)]
 ORDER BY small.bytes DESC;
 
-\echo
-\echo '================================================================'
-\echo ' PHASE 6d — Foreign keys without a supporting index'
-\echo '================================================================'
-\echo '   Common cause of slow cascade DELETEs and lock escalations.'
-\echo
 
+-- ============================================================================
+-- 6d  Foreign keys without a supporting index.
+-- Common cause of slow cascade DELETEs and lock escalations on the parent
+-- side. The index must lead with the FK columns in order.
+-- ============================================================================
 SELECT
-  c.conrelid::regclass AS table_name,
-  c.conname AS fk_constraint,
-  array_agg(a.attname ORDER BY x.ord) AS fk_columns,
-  pg_size_pretty(pg_relation_size(c.conrelid)) AS table_size
+  c.conrelid::regclass                          AS table_name,
+  c.conname                                     AS fk_constraint,
+  array_agg(a.attname ORDER BY x.ord)           AS fk_columns,
+  pg_size_pretty(pg_relation_size(c.conrelid))  AS table_size
 FROM pg_constraint c
 CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS x(attnum, ord)
 JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = x.attnum
@@ -120,18 +116,15 @@ WHERE c.contype = 'f'
 GROUP BY c.oid, c.conrelid, c.conname
 ORDER BY pg_relation_size(c.conrelid) DESC;
 
-\echo
-\echo '================================================================'
-\echo ' PHASE 6e — Invalid indexes (failed CREATE INDEX CONCURRENTLY)'
-\echo '================================================================'
-\echo
 
-SELECT i.indexrelid::regclass AS index_name,
-       i.indrelid::regclass   AS table_name,
-       pg_size_pretty(pg_relation_size(i.indexrelid)) AS size
+-- ============================================================================
+-- 6e  Invalid indexes (failed CREATE INDEX CONCURRENTLY).
+-- These still consume disk and are updated by writes, but ignored by the
+-- planner. Drop or rebuild.
+-- ============================================================================
+SELECT i.indexrelid::regclass                            AS index_name,
+       i.indrelid::regclass                              AS table_name,
+       pg_size_pretty(pg_relation_size(i.indexrelid))    AS size
 FROM pg_index i
 WHERE NOT i.indisvalid
 ORDER BY pg_relation_size(i.indexrelid) DESC;
-
-\echo
-\echo '-- Phase 6 complete --'
