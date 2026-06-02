@@ -63,27 +63,40 @@ ORDER BY sum(bytes) DESC;
 -- 6c  Prefix-redundant indexes.
 -- (a) is redundant if (a,b) exists with the same predicate and opclasses.
 -- Unique indexes are excluded — uniqueness can be a one-column property.
+-- Slice indkey at indnkeyatts to exclude INCLUDE (covering) columns —
+-- an INCLUDE column does not make an index redundant for key-search use.
+-- indkey is an int2vector (0-based); convert to a 1-based int[] for slicing.
 -- ============================================================================
 WITH idx AS (
   SELECT
-    indexrelid::regclass    AS idx_name,
-    indrelid                AS table_oid,
-    indrelid::regclass      AS table_name,
-    indkey::int[]           AS keycols,
-    indclass::oid[]         AS keyops,
-    pg_relation_size(indexrelid) AS bytes,
-    COALESCE(indpred::text,'') AS pred,
+    indexrelid::regclass                                                AS idx_name,
+    indrelid                                                            AS table_oid,
+    indrelid::regclass                                                  AS table_name,
+    (pg_catalog.string_to_array(pg_catalog.int2vectorout(indkey),' '))::int[]
+                                                                        AS keycols_full,
+    indnkeyatts,
+    indclass::oid[]                                                     AS keyops,
+    pg_relation_size(indexrelid)                                        AS bytes,
+    COALESCE(indpred::text, '')                                         AS pred,
     indisunique
   FROM pg_index
   WHERE indislive
+),
+idx_keys AS (
+  SELECT
+    idx_name, table_oid, table_name,
+    keycols_full[1:indnkeyatts] AS keycols,
+    keyops[1:indnkeyatts]       AS keyops,
+    bytes, pred, indisunique
+  FROM idx
 )
 SELECT
   small.table_name,
-  small.idx_name             AS redundant_index,
-  big.idx_name               AS covered_by,
+  small.idx_name              AS redundant_index,
+  big.idx_name                AS covered_by,
   pg_size_pretty(small.bytes) AS reclaimable
-FROM idx small
-JOIN idx big
+FROM idx_keys small
+JOIN idx_keys big
   ON small.table_oid = big.table_oid
  AND small.idx_name <> big.idx_name
  AND small.pred     = big.pred
