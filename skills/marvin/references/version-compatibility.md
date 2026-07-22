@@ -27,10 +27,22 @@ If `pg16_plus = false`, abort.
 
 → `assets/05-workload-hotspots.sql` ships `5b [PG16]` and `5b [PG17+]`. Agent picks via `pg17_plus`.
 
+### Checkpoint stats — second branch (`5k`)
+
+`assets/05-workload-hotspots.sql` ships `5k [PG16]` (`pg_stat_bgwriter`) and `5k [PG17+]` (`pg_stat_checkpointer`). Agent picks via `pg17_plus`.
+
+| Column | PG16 (`pg_stat_bgwriter`) | PG17 (`pg_stat_checkpointer`) |
+|---|---|---|
+| timed checkpoints | `checkpoints_timed` | `num_timed` |
+| requested checkpoints | `checkpoints_req` | `num_requested` |
+| write / sync time | `checkpoint_write_time` / `checkpoint_sync_time` | `write_time` / `sync_time` |
+| buffers written by ckpt | `buffers_checkpoint` | `buffers_written` |
+| restartpoints (replica) | — | `restartpoints_timed` / `restartpoints_req` / `restartpoints_done` |
+
+`req_pct` = requested / (requested + timed). `> 30%` → raise `max_wal_size` (see `interpretation-thresholds.md`).
+
 ### Other notable differences (no branch shipped yet)
 
-- **`pg_stat_checkpointer`** (PG17 new): `num_timed`, `num_requested`, `write_time`, `sync_time`, `buffers_written`, `slru_written`, `restartpoints_*`. Phase 8 will branch on this when shipped.
-- **`pg_stat_bgwriter`** (PG17): checkpoint-related columns moved to `pg_stat_checkpointer`; bgwriter-only columns remain.
 - **`pg_stat_progress_vacuum.delay_time`** (PG17 new) — useful when watching a long vacuum.
 
 ### PG16+ features marvin relies on

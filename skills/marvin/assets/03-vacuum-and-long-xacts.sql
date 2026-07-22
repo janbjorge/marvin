@@ -55,13 +55,19 @@ LIMIT 25;
 
 
 -- ============================================================================
--- 3c  Autovacuum workers running.
+-- 3c  Autovacuum workers running. xact_age > 1h → HIGH: worker can't keep up
+-- (tune autovacuum_vacuum_cost_limit / maintenance_work_mem, or the table
+-- wants per-table overrides — see 3d). anti_wraparound = true → NEVER
+-- pg_terminate_backend it; the cluster is defending against wraparound.
 -- ============================================================================
 SELECT pid, datname, query, state, wait_event_type, wait_event,
-       now() - xact_start AS xact_age
+       now() - xact_start                         AS xact_age,
+       now() - xact_start > interval '1 hour'      AS over_1h,
+       query ILIKE '%to prevent wraparound%'       AS anti_wraparound
 FROM pg_stat_activity
 WHERE backend_type = 'autovacuum worker'
-   OR query ILIKE 'autovacuum:%';
+   OR query ILIKE 'autovacuum:%'
+ORDER BY xact_age DESC;
 
 
 -- ============================================================================

@@ -134,3 +134,42 @@ SELECT i.indexrelid::regclass                            AS index_name,
 FROM pg_index i
 WHERE NOT i.indisvalid
 ORDER BY pg_relation_size(i.indexrelid) DESC;
+
+
+-- ============================================================================
+-- 6f  Tables without a usable replica identity. No PK / no replicable unique
+-- index blocks two things: pg_repack refuses the table, and logical
+-- replication UPDATE/DELETE fails ("cannot update table ... because it does
+-- not have a replica identity"). relreplident: 'd'=default (uses PK),
+-- 'i'=USING INDEX, 'f'=FULL (whole row as key — slow), 'n'=NOTHING.
+-- Bad = 'd' with no PK, or 'n'. 'f' flagged separately (works but expensive).
+-- Partitions excluded (identity is set on the partitioned parent).
+-- ============================================================================
+SELECT
+  c.oid::regclass                                AS table_name,
+  c.relreplident                                 AS replica_identity,
+  EXISTS (SELECT 1 FROM pg_index i
+          WHERE i.indrelid = c.oid AND i.indisprimary) AS has_pk,
+  pg_size_pretty(pg_total_relation_size(c.oid))  AS total_size,
+  CASE
+    WHEN c.relreplident = 'n' THEN 'NOTHING — no logical UPDATE/DELETE, no repack'
+    WHEN c.relreplident = 'd'
+     AND NOT EXISTS (SELECT 1 FROM pg_index i
+                     WHERE i.indrelid = c.oid AND i.indisprimary)
+                              THEN 'default but no PK — same breakage'
+    WHEN c.relreplident = 'f' THEN 'FULL — works but whole-row key is slow'
+  END                                            AS problem
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind = 'r'
+  AND NOT c.relispartition
+  AND n.nspname NOT IN ('pg_catalog','information_schema')
+  AND n.nspname NOT LIKE 'pg_temp%'
+  AND (
+        c.relreplident = 'n'
+     OR c.relreplident = 'f'
+     OR (c.relreplident = 'd'
+         AND NOT EXISTS (SELECT 1 FROM pg_index i
+                         WHERE i.indrelid = c.oid AND i.indisprimary))
+      )
+ORDER BY pg_total_relation_size(c.oid) DESC;

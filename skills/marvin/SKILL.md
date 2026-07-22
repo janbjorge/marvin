@@ -96,32 +96,33 @@ Borderline → propose `pgstattuple_approx('schema.table')`. Do not run `pgstatt
 
 #### B. Index health — `06-index-health.sql`
 
-`6a` unused, `6b` duplicate, `6c` prefix-redundant, `6d` missing FK index, `6e` invalid. `6a` already excludes unique/primary/constraint-backing.
+`6a` unused, `6b` duplicate, `6c` prefix-redundant, `6d` missing FK index, `6e` invalid, `6f` no usable replica identity. `6a` already excludes unique/primary/constraint-backing.
 
 | Severity | Trigger |
 |---|---|
-| HIGH | total `6a` > 1 GB on a high-write DB; any `6e`; `6d` on table > 1 GB |
-| MEDIUM | total `6a` > 100 MB |
+| HIGH | total `6a` > 1 GB on a high-write DB; any `6e`; `6d` on table > 1 GB; `6f` `replica_identity = 'n'` or (`'d'` AND `has_pk = false`) on a logically-replicated or repack-target table |
+| MEDIUM | total `6a` > 100 MB; `6f` `replica_identity = 'f'` (FULL — works, whole-row key is slow) |
 
 #### C. Vacuum & long transactions — `03-vacuum-and-long-xacts.sql`
 
 | Severity | Trigger |
 |---|---|
 | CRITICAL | `state = 'idle in transaction (aborted)'` |
-| HIGH | open transaction > 1 hour |
+| HIGH | open transaction > 1 hour; `3c` `over_1h = true` AND `anti_wraparound = false` (worker can't keep up → tune) |
 
-`3a-slots` / replication-slot xmin holders are equally bad — they hold xmin without showing up in `pg_stat_activity`.
+`3a-slots` / replication-slot xmin holders are equally bad — they hold xmin without showing up in `pg_stat_activity`. Never `pg_terminate_backend` a `3c` row with `anti_wraparound = true`.
 
 #### D. Workload hotspots — `05-workload-hotspots.sql`
 
-Twelve blocks; preflight gates them: `pg_stat_statements` missing → skip 5a–5e + 5b2; `track_io_timing = off` → rank 5b by `shared_blks_read` and flag; `pg17_plus = true` → use 5b [PG17+] (the `shared_blk_*_time` rename), else 5b [PG16].
+Preflight gates them: `pg_stat_statements` missing → skip 5a–5e + 5b2 (5f–5l read `pg_stat_*`, not gated); `track_io_timing = off` → rank 5b by `shared_blks_read` and flag; `pg17_plus = true` → use 5b [PG17+] (the `shared_blk_*_time` rename) and 5k [PG17+] (`pg_stat_checkpointer`), else 5b [PG16] / 5k [PG16] (`pg_stat_bgwriter`).
 
 | Severity | Trigger |
 |---|---|
 | HIGH | `pct_total >= 25` (5a); `mean_ms > 1000` AND `calls > 100`; `seq_pct > 80` on table > 1 GB (5f) |
-| MEDIUM | `coeff_var > 1.0` AND `calls > 100` (5d); `hot_pct < 50` AND `n_tup_upd > 1M` (5g) |
+| MEDIUM | `coeff_var > 1.0` AND `calls > 100` (5d); `hot_pct < 50` AND `n_tup_upd > 1M` (5g); `req_pct > 30` (5k) → raise `max_wal_size` |
+| LOW | 5l partition candidates (design suggestion, not a defect) |
 
-Flag any 5j domination by `IO` / `LWLock` at the severity of the underlying I/O finding.
+Flag any 5j domination by `IO` / `LWLock` at the severity of the underlying I/O finding. 5k `req_pct` is only meaningful against `stats_age` — a fresh `stats_reset` makes the ratio noisy.
 
 For flagged queries: propose `EXPLAIN (ANALYZE, BUFFERS) <query>` and ask the user to paste back. Do **not** auto-run `EXPLAIN ANALYZE` — it executes the statement.
 
@@ -183,9 +184,9 @@ Draft → confirm → execute per statement. Lock impact + duration come from `r
 | Severity | Trigger |
 |---|---|
 | CRITICAL | wraparound `pct_to_emergency_av >= 100`; `wal_status = 'lost'`; `idle in transaction (aborted)`; disk-full read-only |
-| HIGH | pgexperts `bloat_pct > 20` AND `bloat_size > 1 GB`; transaction open > 1h; blocking chain; invalid index; missing FK index on table > 1 GB; query `pct_total >= 25`; cache hit < 90% on busy table; connections > 90% of `max_connections` |
-| MEDIUM | 10–20% bloat; unused indexes > 100 MB total; `coeff_var > 1.0` AND `calls > 100`; `hot_pct < 50` on update-heavy table; no autovacuum in 7d on active table |
-| LOW | duplicate small indexes; minor stats staleness; minor config drift |
+| HIGH | pgexperts `bloat_pct > 20` AND `bloat_size > 1 GB`; transaction open > 1h; autovacuum worker > 1h (not anti-wraparound); blocking chain; invalid index; missing FK index on table > 1 GB; no usable replica identity (6f `'n'`, or `'d'` + no PK); query `pct_total >= 25`; cache hit < 90% on busy table; connections > 90% of `max_connections` |
+| MEDIUM | 10–20% bloat; unused indexes > 100 MB total; `coeff_var > 1.0` AND `calls > 100`; `hot_pct < 50` on update-heavy table; no autovacuum in 7d on active table; checkpoint `req_pct > 30`; replica identity `FULL` |
+| LOW | duplicate small indexes; minor stats staleness; minor config drift; large non-partitioned table (partition candidate) |
 
 ## References
 

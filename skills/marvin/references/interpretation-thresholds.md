@@ -49,9 +49,30 @@ The `< 90%` threshold in `SKILL.md` is directional, not diagnostic.
 
 **`last_idx_scan` (PG16+) beats `idx_scan = 0`.** Timestamp survives stats resets, lets you say "last used 187 days ago" rather than guessing. Use both: `idx_scan = 0` AND `last_idx_scan IS NULL OR last_idx_scan < now() - interval '...' `.
 
+## Replica identity / missing PK
+
+Source: `06-index-health.sql` block `6f` — `pg_class.relreplident` + `pg_index.indisprimary`.
+
+A heap table with `relreplident = 'n'` (NOTHING), or `'d'` (default) and no primary key, has no usable replica identity. Two concrete failures:
+
+- **Logical replication**: `UPDATE`/`DELETE` on it raises `cannot update table ... it does not have a replica identity and publishes updates`. Silent until the first mutation replicates.
+- **`pg_repack`**: refuses the table (`ERROR: table ... must have a primary key or not-null unique keys`). Your bloat remediation stops at the tables that need it most.
+
+`'f'` (FULL) works for logical replication but uses the whole row as the key — every `UPDATE`/`DELETE` scans the subscriber with no index. MEDIUM, not HIGH: correct, just slow. Fix is add a PK or a `NOT NULL` unique index, then `ALTER TABLE ... REPLICA IDENTITY USING INDEX`.
+
+Partitions are excluded — identity is declared on the partitioned parent, not each partition.
+
+## Partition candidates
+
+Source: `05-workload-hotspots.sql` block `5l`. LOW / informational. A > 50 GB non-partitioned heap is a *candidate*, not a defect — partitioning pays off for time-series (drop old partitions instead of mass `DELETE` + bloat) and for per-partition autovacuum tuning. It costs a migration and adds partition-pruning risk if queries don't carry the partition key. Never auto-flag as actionable; surface the size + `n_tup_del` and let the operator judge.
+
 ## Checkpoints
 
-`checkpoints_req / (checkpoints_req + checkpoints_timed) > 30%` → workload is pushing past `max_wal_size` between scheduled checkpoints. Fix is almost always **raise `max_wal_size`** (default 1 GB; 8–16 GB is routine on modern disks). Downside: longer crash recovery.
+Source: `05-workload-hotspots.sql` block `5k` — `req_pct` (PG16 `pg_stat_bgwriter`, PG17 `pg_stat_checkpointer`).
+
+`req_pct > 30%` (`checkpoints_req / (checkpoints_req + checkpoints_timed)`, or PG17 `num_requested / (num_requested + num_timed)`) → workload is pushing past `max_wal_size` between scheduled checkpoints. Fix is almost always **raise `max_wal_size`** (default 1 GB; 8–16 GB is routine on modern disks). Downside: longer crash recovery.
+
+Only meaningful against `stats_reset` age — a checkpointer counter reset an hour ago produces a noisy ratio. Cite `stats_age` from the same row.
 
 ## Severity tiers
 
