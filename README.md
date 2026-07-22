@@ -2,7 +2,7 @@
 
 **Senior-DBA-grade PostgreSQL audits for LLMs. One Skill folder. Read-only. PG16+.**
 
-marvin is a [Claude Skill](https://docs.claude.com/en/docs/claude-code/skills) that turns an MCP-capable agent into a thorough, opinionated, read-only Postgres reviewer. Every finding cites the catalog row that produced it. Bloat math is the [pgexperts statistics-based estimate](https://github.com/ioguix/pgsql-bloat-estimation) — not the `n_dead_tup` ratio LLMs love to hallucinate. Wraparound-, replica-, and Azure-Flexible-Server-aware.
+marvin is a [Claude Skill](https://docs.claude.com/en/docs/claude-code/skills) that turns an MCP-capable agent into a thorough, opinionated, read-only Postgres reviewer. Every finding cites the catalog row that produced it. Bloat math is the [pgexperts statistics-based estimate](https://github.com/ioguix/pgsql-bloat-estimation), not the `n_dead_tup` ratio LLMs love to hallucinate. Wraparound-, replica-, and Azure-Flexible-Server-aware.
 
 Talks to Postgres exclusively through **[pglens](https://github.com/janbjorge/pglens)** (read-only MCP).
 
@@ -33,7 +33,7 @@ git clone https://github.com/janbjorge/marvin.git /tmp/marvin
 cp -r /tmp/marvin/skills/marvin ~/.claude/skills/marvin
 ```
 
-For Codex CLI or OpenCode, point your `AGENTS.md` / `opencode.jsonc` at `skills/marvin/SKILL.md` — it's a self-contained instruction file.
+For Codex CLI or OpenCode, point your `AGENTS.md` / `opencode.jsonc` at `skills/marvin/SKILL.md`. It's a self-contained instruction file.
 
 Trigger with *"Postgres health check"*, *"bloat audit"*, or *"why is my DB slow"*.
 
@@ -131,10 +131,10 @@ marvin/
 ## Limitations
 
 - PG16+ only.
-- Read-only — no automatic fixes.
+- Read-only. No automatic fixes.
 - Not a monitoring replacement (no historical trending).
 - Single-database run per session (cluster-wide risks surface; per-DB phases hit the connected DB).
-- Doesn't profile individual queries — paste `EXPLAIN (ANALYZE, BUFFERS)` output back.
+- Doesn't profile individual queries. Paste `EXPLAIN (ANALYZE, BUFFERS)` output back.
 
 ## License
 
