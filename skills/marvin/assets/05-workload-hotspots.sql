@@ -279,3 +279,72 @@ ORDER BY count(*) DESC;
 SELECT extname, extversion
 FROM pg_extension
 WHERE extname = 'pg_wait_sampling';
+
+
+-- ============================================================================
+-- 5k [PG16]  Checkpoint pressure (pg_stat_bgwriter). req_pct > 30 → workload
+-- fills max_wal_size between timed checkpoints → raise max_wal_size (default
+-- 1 GB; 8-16 GB routine). Not pg_stat_statements-gated. Rate against
+-- stats_reset age. PG17 moved these columns → 5k [PG17+].
+-- ============================================================================
+SELECT
+  checkpoints_timed,
+  checkpoints_req,
+  CASE WHEN checkpoints_timed + checkpoints_req > 0
+       THEN round((100.0 * checkpoints_req /
+                   (checkpoints_timed + checkpoints_req))::numeric, 1)
+       ELSE 0
+  END                                             AS req_pct,
+  round(checkpoint_write_time::numeric, 0)        AS write_ms,
+  round(checkpoint_sync_time::numeric, 0)         AS sync_ms,
+  buffers_checkpoint,
+  buffers_backend,
+  stats_reset,
+  now() - stats_reset                             AS stats_age
+FROM pg_stat_bgwriter;
+
+
+-- ============================================================================
+-- 5k [PG17+]  Checkpoint pressure (pg_stat_checkpointer). Use when
+-- pg17_plus = true — checkpoint columns left pg_stat_bgwriter in PG17.
+-- Same req_pct > 30 → raise max_wal_size. restartpoints_* nonzero on replicas.
+-- ============================================================================
+SELECT
+  num_timed,
+  num_requested,
+  CASE WHEN num_timed + num_requested > 0
+       THEN round((100.0 * num_requested /
+                   (num_timed + num_requested))::numeric, 1)
+       ELSE 0
+  END                                             AS req_pct,
+  round(write_time::numeric, 0)                   AS write_ms,
+  round(sync_time::numeric, 0)                    AS sync_ms,
+  buffers_written,
+  restartpoints_timed,
+  restartpoints_req,
+  stats_reset,
+  now() - stats_reset                             AS stats_age
+FROM pg_stat_checkpointer;
+
+
+-- ============================================================================
+-- 5l  Partition candidates (LOW). Large non-partitioned heap tables. Blog
+-- advice: partitioning enables per-partition autovacuum tuning + instant
+-- old-data drop (DETACH/DROP vs mass DELETE + bloat). Design change, not a
+-- defect — informational. 50 GB floor drops noise; adjust per workload.
+-- ============================================================================
+SELECT
+  c.oid::regclass                                AS table_name,
+  pg_size_pretty(pg_total_relation_size(c.oid))  AS total_size,
+  s.n_live_tup,
+  s.seq_scan,
+  s.n_tup_del
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+WHERE c.relkind = 'r'
+  AND NOT c.relispartition
+  AND n.nspname NOT IN ('pg_catalog','information_schema')
+  AND pg_total_relation_size(c.oid) > 50::bigint * 1024 * 1024 * 1024
+ORDER BY pg_total_relation_size(c.oid) DESC
+LIMIT 15;
