@@ -1,33 +1,45 @@
 -- marvin: 07-replication.sql — Phase 7. Read-only. PG16+.
--- Physical + logical replication health. Run 7a/7c/7d on the primary, 7b/7g on
--- a standby. Lag in BYTES is the alertable signal; the *_lag intervals go NULL
--- on an idle primary (docs: monitoring-stats). Thresholds: pganalyze
--- high_lag — warn 100 MB, critical 1 GB sustained.
+-- 7a/7c/7d on the primary, 7b/7g on a standby. Lag in BYTES is the alertable
+-- signal; *_lag intervals go NULL on an idle primary. Replication GUCs are in
+-- 0-settings (max_slot_wal_keep_size = -1 with slots present → MEDIUM;
+-- hot_standby_feedback = on → LOW, state the trade-off).
 
 -- ============================================================================
--- 7a  Standbys seen from the primary. Empty when replicas are expected → HIGH
--- (pganalyze follower_missing). replay_lag_bytes >> flush_lag_bytes = replica
--- apply is the bottleneck (recovery conflict / slow disk), not the network.
--- backend_xmin non-NULL = hot_standby_feedback pins xmin on the primary (3a).
+-- 7a  Standbys seen from the primary. Empty when replicas are expected →
+-- HIGH. severity: replay lag > 1 GB → HIGH, > 100 MB → MEDIUM (pganalyze).
+-- apply_bottleneck = replay lag more than double flush lag (recovery
+-- conflict / slow standby, see 7g). backend_xmin non-NULL = hot_standby_
+-- feedback pinning xmin on the primary (7c).
 -- ============================================================================
+WITH r AS (
+  SELECT *,
+         pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn)   AS sent_b,
+         pg_wal_lsn_diff(pg_current_wal_lsn(), write_lsn)  AS write_b,
+         pg_wal_lsn_diff(pg_current_wal_lsn(), flush_lsn)  AS flush_b,
+         pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) AS replay_b
+  FROM pg_stat_replication
+)
 SELECT
   pid, usename, application_name, client_addr, state, sync_state,
-  pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn))   AS sent_lag_bytes,
-  pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), write_lsn))  AS write_lag_bytes,
-  pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), flush_lsn))  AS flush_lag_bytes,
-  pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)) AS replay_lag_bytes,
-  pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)                 AS replay_lag_raw,
+  pg_size_pretty(sent_b)   AS sent_lag_bytes,
+  pg_size_pretty(write_b)  AS write_lag_bytes,
+  pg_size_pretty(flush_b)  AS flush_lag_bytes,
+  pg_size_pretty(replay_b) AS replay_lag_bytes,
+  replay_b                 AS replay_lag_raw,
   write_lag, flush_lag, replay_lag,
-  backend_xmin, age(backend_xmin)                                   AS backend_xmin_age,
-  backend_start, reply_time
-FROM pg_stat_replication
-ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) DESC NULLS LAST;
+  backend_xmin, age(backend_xmin) AS backend_xmin_age,
+  backend_start, reply_time,
+  replay_b > 2 * flush_b AND replay_b > 100 * 1024 * 1024 AS apply_bottleneck,
+  CASE WHEN replay_b > 1024::bigint^3    THEN 'HIGH'
+       WHEN replay_b > 100 * 1024 * 1024 THEN 'MEDIUM' END AS severity
+FROM r
+ORDER BY replay_b DESC NULLS LAST;
 
 
 -- ============================================================================
--- 7b  Standby self-check. All NULL on a primary (is_replica = false).
--- replay_delay is inflated on an idle primary — cite apply_backlog (bytes).
--- receiver_status <> 'streaming' → HIGH.
+-- 7b  Standby self-check. All NULL on a primary — not a finding. Cite
+-- apply_backlog (bytes), not replay_delay (inflates when the primary idles).
+-- severity HIGH = replica whose receiver is not streaming.
 -- ============================================================================
 SELECT
   pg_is_in_recovery()                                  AS is_replica,
@@ -41,15 +53,15 @@ SELECT
   (SELECT status      FROM pg_stat_wal_receiver)       AS receiver_status,
   (SELECT sender_host FROM pg_stat_wal_receiver)       AS sender_host,
   (SELECT slot_name   FROM pg_stat_wal_receiver)       AS slot_name,
-  current_setting('hot_standby_feedback')              AS hot_standby_feedback,
-  current_setting('max_standby_streaming_delay')       AS max_standby_streaming_delay;
+  CASE WHEN pg_is_in_recovery()
+        AND (SELECT status FROM pg_stat_wal_receiver) IS DISTINCT FROM 'streaming'
+       THEN 'HIGH' END                                 AS severity;
 
 
 -- ============================================================================
--- 7c  Combined xmin horizon — every holder in one list (postgres.ai howto
--- 0045). Whichever row is oldest is what autovacuum is waiting on. The
--- pg_stat_replication row only appears with hot_standby_feedback = on.
--- pganalyze xmin_horizon: warn when the oldest is > 24 h.
+-- 7c  Combined xmin horizon — every holder, oldest first (postgres.ai howto
+-- 0045). The top row is what autovacuum waits on. xmin_age is in
+-- transactions; time-based severity comes from 3a for session holders.
 -- ============================================================================
 SELECT source, holder, xmin_age, detail FROM (
   SELECT 'pg_stat_activity.backend_xmin' AS source, pid::text AS holder,
@@ -75,9 +87,8 @@ LIMIT 20;
 
 
 -- ============================================================================
--- 7d  Logical slots — decoding lag + spill. confirmed_flush_lag = WAL the
--- consumer has not acknowledged. spill_bytes growing → logical_decoding_work_mem
--- (default 64 MB) too small; every spilled txn is a disk round-trip.
+-- 7d  Logical slots — decoding lag + spill. severity MEDIUM = spill_bytes > 0
+-- (confirm growth) → raise logical_decoding_work_mem (default 64 MB).
 -- ============================================================================
 SELECT
   s.slot_name, r.plugin, r.database, r.active,
@@ -86,16 +97,16 @@ SELECT
   s.stream_txns, pg_size_pretty(s.stream_bytes)               AS streamed,
   s.total_txns,  pg_size_pretty(s.total_bytes)                AS total_decoded,
   current_setting('logical_decoding_work_mem')                AS logical_decoding_work_mem,
-  s.stats_reset
+  s.stats_reset,
+  CASE WHEN s.spill_bytes > 0 THEN 'MEDIUM' END               AS severity
 FROM pg_stat_replication_slots s
 JOIN pg_replication_slots r ON r.slot_name = s.slot_name
 ORDER BY s.spill_bytes DESC NULLS LAST;
 
 
 -- ============================================================================
--- 7e  Subscriptions (this DB is a logical subscriber). worker_alive = false on
--- an enabled subscription = apply worker crashed → HIGH. apply_error_count or
--- sync_error_count growing → HIGH (check the log for the failing row).
+-- 7e  Subscriptions (this DB is a logical subscriber). severity HIGH =
+-- enabled with no apply worker, or any apply/sync errors (check the log).
 -- ============================================================================
 SELECT
   sub.subname, sub.subenabled, sub.subslotname, sub.subpublications,
@@ -103,8 +114,9 @@ SELECT
   st.pid IS NOT NULL                      AS worker_alive,
   st.received_lsn, st.latest_end_lsn, st.latest_end_time,
   now() - st.latest_end_time              AS since_last_end,
-  ss.apply_error_count, ss.sync_error_count,
-  ss.stats_reset
+  ss.apply_error_count, ss.sync_error_count, ss.stats_reset,
+  CASE WHEN (sub.subenabled AND st.pid IS NULL)
+         OR ss.apply_error_count > 0 OR ss.sync_error_count > 0 THEN 'HIGH' END AS severity
 FROM pg_subscription sub
 LEFT JOIN pg_stat_subscription st ON st.subid = sub.oid AND st.relid IS NULL
 LEFT JOIN pg_stat_subscription_stats ss ON ss.subid = sub.oid
@@ -112,42 +124,24 @@ ORDER BY sub.subname;
 
 
 -- ============================================================================
--- 7e [PG18]  Logical replication conflict counters (new in PG18). Any
--- non-zero column = rows silently skipped or errored on apply. Use when
--- pg18_plus = true; columns do not exist on PG16/17.
+-- 7e [PG18]  Logical replication conflict counters. severity MEDIUM = any
+-- non-zero (rows skipped or errored on apply). Use when pg18_plus = true.
 -- ============================================================================
 SELECT subname,
   confl_insert_exists, confl_update_origin_differs, confl_update_exists,
   confl_update_missing, confl_delete_origin_differs, confl_delete_missing,
-  confl_multiple_unique_conflicts
+  confl_multiple_unique_conflicts,
+  CASE WHEN confl_insert_exists + confl_update_origin_differs + confl_update_exists
+          + confl_update_missing + confl_delete_origin_differs + confl_delete_missing
+          + confl_multiple_unique_conflicts > 0 THEN 'MEDIUM' END AS severity
 FROM pg_stat_subscription_stats
 ORDER BY subname;
 
 
 -- ============================================================================
--- 7f  Replication settings. max_slot_wal_keep_size = -1 (default) = a stuck
--- slot can fill the disk (1b safe_wal_size shows 'unbounded').
--- idle_replication_slot_timeout (PG18, default 0 = off) auto-invalidates idle
--- slots. hot_standby_feedback = on trades standby query cancels for primary
--- bloat (Cybertec). Read via pg_settings so missing GUCs return no row.
--- ============================================================================
-SELECT name, setting, unit, boot_val, source, pending_restart
-FROM pg_settings
-WHERE name IN (
-  'wal_level','max_wal_senders','max_replication_slots','wal_keep_size','max_slot_wal_keep_size',
-  'idle_replication_slot_timeout','hot_standby','hot_standby_feedback','max_standby_streaming_delay',
-  'max_standby_archive_delay','wal_receiver_status_interval','wal_receiver_timeout','wal_sender_timeout',
-  'synchronous_commit','synchronous_standby_names','logical_decoding_work_mem','max_logical_replication_workers',
-  'max_sync_workers_per_subscription','archive_mode','archive_timeout','recovery_min_apply_delay'
-)
-ORDER BY name;
-
-
--- ============================================================================
--- 7g  Recovery conflicts on a standby (cumulative since stats_reset). All
--- zero on a primary. confl_snapshot → hot_standby_feedback or longer
--- max_standby_streaming_delay; confl_lock → DDL on primary vs long standby
--- queries.
+-- 7g  Recovery conflicts on a standby (cumulative). All zero on a primary.
+-- confl_snapshot → hot_standby_feedback or longer max_standby_streaming_delay;
+-- confl_lock → DDL on primary vs long standby queries.
 -- ============================================================================
 SELECT datname, confl_tablespace, confl_lock, confl_snapshot, confl_bufferpin,
        confl_deadlock, confl_active_logicalslot
