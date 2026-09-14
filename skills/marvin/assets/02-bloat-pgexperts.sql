@@ -134,7 +134,7 @@ FROM (
       ) AS nulldatahdrwidth, pagehdr, pageopqdata, is_na
     FROM (
       SELECT
-        i.nspname, i.tblname, i.idxname, i.reltuples, i.relpages, i.idxoid, i.fillfactor,
+        n.nspname, i.tblname, i.idxname, i.reltuples, i.relpages, i.idxoid, i.fillfactor,
         current_setting('block_size')::numeric AS bs,
         CASE WHEN version() ~ 'mingw32' OR version() ~ '64-bit|x86_64|ppc64|ia64|amd64' THEN 8 ELSE 4 END AS maxalign,
         24 AS pagehdr,
