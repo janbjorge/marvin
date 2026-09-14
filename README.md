@@ -40,21 +40,15 @@ Trigger it with *"Postgres health check"*, *"bloat audit"*, or *"why is my DB sl
 ## How an agent uses it
 
 ```
-1. 00-preflight                 → pg_ver, pg17_plus, pg18_plus, is_replica, stats age
-2. abort if pg_ver < 160000
-3. 01-existential-threats       → halt on wraparound / lost slot; 'unbounded' slot retention
-4. 02-bloat-pgexperts           → table vs B-tree bloat severity from pgexperts numbers
-5. 03-vacuum-and-long-xacts     → long xacts, autovacuum urgency (PG18 cap-aware), parents never analyzed
-6. 04-locks-and-blocking
-7. 05-workload-hotspots         → pg_stat_statements eviction check, then 5b/5k [PG16] vs [PG17+]
-8. if azure_sys exists          → reconnect, run 05a-azure-query-store
-9. 06-index-health              → unused (FK-aware) / duplicate / prefix-redundant / missing-FK / invalid
-10. 07-replication              → lag bytes, xmin horizon, logical slots, subscriptions
-11. 08-config-and-capacity      → drift, pg_stat_database counters, connections, sequences, lock table
-12. synthesise                  → severity-ranked findings, each citing a catalog row
+1. 00-preflight            → version flags, stats-age gates, extensions, every GUC with its config-rule severity
+2. abort if pg16_plus = false
+3. 01-existential-threats  → halt on any severity = CRITICAL (wraparound, lost slot)
+4. 02 … 08                 → one asset per phase; every block emits a severity column
+5. if query_store exists   → reconnect to azure_sys, run 05a
+6. synthesise              → severity-ranked findings, each citing view/column = value
 ```
 
-The agent must keep three contracts: stay read-only, source every number from a query result, and never run `EXPLAIN ANALYZE` against production without confirmation.
+The agent must keep three contracts: stay read-only, take every number and every comparison from SQL (blocks emit `severity`, the agent cites it), and never run `EXPLAIN ANALYZE` against production without confirmation.
 
 ## Database connection
 
@@ -77,7 +71,7 @@ If pglens is unreachable, marvin falls back to user-mediated mode. It prints the
 
 | # | Phase | Asset |
 |---|---|---|
-| 0  | Preflight (version, sizes, extensions, settings) | `00-preflight.sql` |
+| 0  | Preflight (version, sizes, stats age, extensions, all GUCs with config-rule severity) | `00-preflight.sql` |
 | 1  | Wraparound, slot bloat, WAL | `01-existential-threats.sql` |
 | 2  | Table + B-tree bloat (pgexperts) | `02-bloat-pgexperts.sql` |
 | 3  | Vacuum lag + long-running transactions | `03-vacuum-and-long-xacts.sql` |
@@ -86,7 +80,7 @@ If pglens is unreachable, marvin falls back to user-mediated mode. It prints the
 | 5a | Azure Query Store (time-bucketed + per-query waits) | `05a-azure-query-store.sql` |
 | 6  | Index health (unused / dup / prefix-redundant / missing-FK / invalid) | `06-index-health.sql` |
 | 7  | Replication (physical lag, xmin horizon, logical slots, subscriptions, conflicts) | `07-replication.sql` |
-| 8  | Config & capacity (drift, `pg_stat_database` counters, connections, sequences, lock table) | `08-config-and-capacity.sql` |
+| 8  | Capacity (memory arithmetic, `pg_stat_database` counters, connections, sequences, lock table) | `08-config-and-capacity.sql` |
 
 Not yet shipped: structured synthesis template, GIN pending-list and BRIN summarisation checks, low-cardinality index detection, PG19.
 
@@ -94,7 +88,9 @@ Not yet shipped: structured synthesis template, GIN pending-list and BRIN summar
 
 Bloat math uses the pgexperts statistics-based estimate, not `n_dead_tup`. For borderline cases marvin recommends `pgstattuple_approx`. The rationale is in `skills/marvin/references/interpretation-thresholds.md`.
 
-Version branching starts at PG16, the hard floor, and goes up to PG18. Blocks `1b`, `5b`, `5k`, and `3c-progress` ship in `[PG16]` and `[PG17+]` variants, because PG17 renamed `blk_*_time` and moved the checkpoint stats. Blocks `3f`, `5i2`, and `7e [PG18]` rely on new PG18 columns and run only there. Everything else is single-variant. PG18-only GUCs are read through `pg_settings`, so on older majors they return no row. PG19 (beta) is not targeted yet.
+Severity lives in the SQL. Each block ends in a `severity` column (`CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, sometimes qualified such as `MEDIUM if OLTP`), so the agent never compares numbers in prose. The only judgments left to the agent are the ones SQL cannot see: workload type, RAM, whether standbys were sampled. `skills/marvin/references/interpretation-thresholds.md` explains where each threshold comes from.
+
+Version branching starts at PG16, the hard floor, and goes up to PG18. Blocks `1b`, `5b`, `5k`, and `3c-progress` ship in `[PG16]` and `[PG17+]` variants, because PG17 renamed `blk_*_time` and moved the checkpoint stats. Blocks `3f`, `5i2`, and `7e [PG18]` rely on new PG18 columns and run only there. Everything else is single-variant. Version-specific GUCs are read through `pg_settings`, so on older majors they return no row. PG19 is not targeted yet.
 
 Replicas are detected up front with `pg_is_in_recovery()`. marvin never proposes `VACUUM`, `CREATE INDEX`, or `pg_terminate_backend` on a hot standby.
 
@@ -104,7 +100,7 @@ Each `assets/NN-*.sql` file is a labelled catalogue with `-- ===` block headers 
 
 | Extension | Phase | Why |
 |---|---|---|
-| `pg_stat_statements` | 5-2, 5a-5e, 5b2 | Required for cumulative query stats; `5-2` checks eviction (`dealloc`) first |
+| `pg_stat_statements` | 5-2, 5a-5e, 5b2 | Cumulative query stats; `5-2` checks eviction (`dealloc`) first |
 | `pgstattuple` | 2 follow-up | Exact bloat when the estimate is borderline |
 | `pg_repack` | remediation | Online table rewrite |
 | `auto_explain` | plan capture | Slow-query plans logged automatically |
