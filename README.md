@@ -40,16 +40,18 @@ Trigger with *"Postgres health check"*, *"bloat audit"*, or *"why is my DB slow"
 ## How an agent uses it
 
 ```
-1. 00-preflight                 → pg_ver, pg17_plus, is_replica
+1. 00-preflight                 → pg_ver, pg17_plus, pg18_plus, is_replica, stats age
 2. abort if pg_ver < 160000
-3. 01-existential-threats       → halt on wraparound / lost slot
-4. 02-bloat-pgexperts           → bloat severity from pgexperts numbers
-5. 03-vacuum-and-long-xacts     → long transactions blocking xmin
+3. 01-existential-threats       → halt on wraparound / lost slot; 'unbounded' slot retention
+4. 02-bloat-pgexperts           → table vs B-tree bloat severity from pgexperts numbers
+5. 03-vacuum-and-long-xacts     → long xacts, autovacuum urgency (PG18 cap-aware), parents never analyzed
 6. 04-locks-and-blocking
-7. 05-workload-hotspots         → pick 5b [PG16] vs 5b [PG17+] from preflight
+7. 05-workload-hotspots         → pg_stat_statements eviction check, then 5b/5k [PG16] vs [PG17+]
 8. if azure_sys exists          → reconnect, run 05a-azure-query-store
-9. 06-index-health              → unused / duplicate / missing-FK / invalid
-10. synthesise                   → severity-ranked findings, each citing a catalog row
+9. 06-index-health              → unused (FK-aware) / duplicate / prefix-redundant / missing-FK / invalid
+10. 07-replication              → lag bytes, xmin horizon, logical slots, subscriptions
+11. 08-config-and-capacity      → drift, pg_stat_database counters, connections, sequences, lock table
+12. synthesise                  → severity-ranked findings, each citing a catalog row
 ```
 
 Contracts the agent must not break: read-only, every number sourced from a query, no `EXPLAIN ANALYZE` against production without confirmation.
@@ -83,14 +85,16 @@ If pglens is unreachable, marvin falls back to **user-mediated mode**: it prints
 | 5  | Workload hotspots (`pg_stat_statements`, `pg_stat_io`, waits) | `05-workload-hotspots.sql` |
 | 5a | Azure Query Store (time-bucketed + per-query waits) | `05a-azure-query-store.sql` |
 | 6  | Index health (unused / dup / prefix-redundant / missing-FK / invalid) | `06-index-health.sql` |
+| 7  | Replication (physical lag, xmin horizon, logical slots, subscriptions, conflicts) | `07-replication.sql` |
+| 8  | Config & capacity (drift, `pg_stat_database` counters, connections, sequences, lock table) | `08-config-and-capacity.sql` |
 
-**Not yet shipped:** replication health, checkpoint / WAL pressure, connection pressure, configuration drift, structured synthesis template.
+**Not yet shipped:** structured synthesis template, GIN pending-list / BRIN summarisation checks, low-cardinality index detection, PG19.
 
 ## How it works
 
 **Bloat math.** Pgexperts statistics-based estimate, not `n_dead_tup`. For borderline cases marvin recommends `pgstattuple_approx`. See `skills/marvin/references/interpretation-thresholds.md` for the rationale.
 
-**Version branching.** PG16+ hard floor. Only `5b` ships in `[PG16]` and `[PG17+]` variants (PG17 renamed `blk_*_time` to `shared_blk_*_time`). Everything else is single-variant.
+**Version branching.** PG16+ hard floor, PG18 supported. `1b`, `5b`, `5k`, `3c-progress` ship in `[PG16]` and `[PG17+]` variants (PG17 renamed `blk_*_time` and moved checkpoint stats). `3f`, `5i2`, `7e [PG18]` are PG18-only blocks (new columns). Everything else is single-variant; PG18-only GUCs are read via `pg_settings` so they simply return no row on older majors. PG19 (beta) is not targeted yet.
 
 **Replica-aware.** `pg_is_in_recovery()` is checked first. No `VACUUM`, no `CREATE INDEX`, no `pg_terminate_backend` against a hot standby.
 
@@ -100,7 +104,7 @@ If pglens is unreachable, marvin falls back to **user-mediated mode**: it prints
 
 | Extension | Phase | Why |
 |---|---|---|
-| `pg_stat_statements` | 5a–5e, 5b2 | Required for cumulative query stats |
+| `pg_stat_statements` | 5-2, 5a–5e, 5b2 | Required for cumulative query stats; `5-2` checks eviction (`dealloc`) first |
 | `pgstattuple` | 2 follow-up | Exact bloat when the estimate is borderline |
 | `pg_repack` | remediation | Online table rewrite |
 | `auto_explain` | plan capture | Slow-query plans logged automatically |
@@ -125,7 +129,9 @@ marvin/
         ├── 04-locks-and-blocking.sql
         ├── 05-workload-hotspots.sql
         ├── 05a-azure-query-store.sql
-        └── 06-index-health.sql
+        ├── 06-index-health.sql
+        ├── 07-replication.sql
+        └── 08-config-and-capacity.sql
 ```
 
 ## Limitations

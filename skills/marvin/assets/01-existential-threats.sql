@@ -44,9 +44,13 @@ LIMIT 30;
 
 
 -- ============================================================================
--- 1b  Replication slot bloat.
+-- 1b [PG16]  Replication slot bloat.
 -- Inactive + retained WAL > 10 GB → HIGH. wal_status 'extended'/'lost' →
 -- CRITICAL (replica can't catch up without fresh basebackup).
+-- safe_wal_size is NULL when max_slot_wal_keep_size = -1 (the default):
+-- report it as 'unbounded' — a stuck slot can fill the disk — never as OK.
+-- catalog_xmin on a logical slot pins catalog vacuum even when xmin is NULL.
+-- Use when pg17_plus = false (inactive_since / invalidation_reason absent).
 -- ============================================================================
 SELECT
   slot_name, plugin, slot_type, database,
@@ -58,7 +62,48 @@ SELECT
     END
   )                                          AS retained_wal,
   wal_status,
-  pg_size_pretty(safe_wal_size)              AS safe_wal_size_remaining
+  CASE WHEN current_setting('max_slot_wal_keep_size') = '-1'
+       THEN 'unbounded (max_slot_wal_keep_size = -1)'
+       ELSE pg_size_pretty(safe_wal_size)
+  END                                        AS safe_wal_size_remaining,
+  conflicting,
+  xmin, age(xmin)                            AS xmin_age,
+  catalog_xmin, age(catalog_xmin)            AS catalog_xmin_age
+FROM pg_replication_slots
+ORDER BY
+  CASE WHEN restart_lsn IS NULL THEN 0
+       ELSE pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)
+  END DESC NULLS LAST;
+
+
+-- ============================================================================
+-- 1b [PG17+]  Same, plus PG17 columns: inactive_for (inactive_since) = how
+-- long nobody consumed the slot; invalidation_reason non-NULL = the server
+-- already gave up on it (wal_removed / rows_removed / wal_level_insufficient
+-- / idle_timeout). PG18: idle_replication_slot_timeout (default 0 = off) can
+-- auto-invalidate idle slots — recommend it with a finite
+-- max_slot_wal_keep_size. Use when pg17_plus = true.
+-- ============================================================================
+SELECT
+  slot_name, plugin, slot_type, database,
+  active, active_pid,
+  pg_size_pretty(
+    CASE
+      WHEN restart_lsn IS NULL THEN 0
+      ELSE pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)
+    END
+  )                                          AS retained_wal,
+  wal_status,
+  CASE WHEN current_setting('max_slot_wal_keep_size') = '-1'
+       THEN 'unbounded (max_slot_wal_keep_size = -1)'
+       ELSE pg_size_pretty(safe_wal_size)
+  END                                        AS safe_wal_size_remaining,
+  inactive_since,
+  CASE WHEN NOT active THEN now() - inactive_since END AS inactive_for,
+  invalidation_reason,
+  conflicting,
+  xmin, age(xmin)                            AS xmin_age,
+  catalog_xmin, age(catalog_xmin)            AS catalog_xmin_age
 FROM pg_replication_slots
 ORDER BY
   CASE WHEN restart_lsn IS NULL THEN 0
