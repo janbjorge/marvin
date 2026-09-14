@@ -1,10 +1,10 @@
 # marvin
 
-**Senior-DBA-grade PostgreSQL audits for LLMs. One Skill folder. Read-only. PG16+.**
+Read-only PostgreSQL audits for LLM agents, at the depth a senior DBA would go. One Skill folder. PG16 and newer.
 
-marvin is a [Claude Skill](https://docs.claude.com/en/docs/claude-code/skills) that turns an MCP-capable agent into a thorough, opinionated, read-only Postgres reviewer. Every finding cites the catalog row that produced it. Bloat math is the [pgexperts statistics-based estimate](https://github.com/ioguix/pgsql-bloat-estimation), not the `n_dead_tup` ratio LLMs love to hallucinate. Wraparound-, replica-, and Azure-Flexible-Server-aware.
+marvin is a [Claude Skill](https://docs.claude.com/en/docs/claude-code/skills) that makes an MCP-capable agent review a Postgres database without writing to it. Every finding cites the catalog row that produced it. Bloat estimates come from the [pgexperts statistics-based method](https://github.com/ioguix/pgsql-bloat-estimation) instead of the `n_dead_tup` ratio that LLMs tend to hallucinate. It accounts for transaction ID wraparound, replicas, and Azure Flexible Server.
 
-Talks to Postgres exclusively through **[pglens](https://github.com/janbjorge/pglens)** (read-only MCP).
+All Postgres access goes through [pglens](https://github.com/janbjorge/pglens), a read-only MCP server.
 
 ```
 User:  "Is my Postgres OK?"
@@ -19,7 +19,7 @@ Agent: → loads marvin
 
 ## Install
 
-Packaged as a Claude Code plugin. Install via the marketplace, or drop the skill directly.
+marvin is packaged as a Claude Code plugin. Install it from the marketplace, or copy the skill folder by hand.
 
 ```bash
 # Claude Code
@@ -33,9 +33,9 @@ git clone https://github.com/janbjorge/marvin.git /tmp/marvin
 cp -r /tmp/marvin/skills/marvin ~/.claude/skills/marvin
 ```
 
-For Codex CLI or OpenCode, point your `AGENTS.md` / `opencode.jsonc` at `skills/marvin/SKILL.md`. It's a self-contained instruction file.
+For Codex CLI or OpenCode, point your `AGENTS.md` or `opencode.jsonc` at `skills/marvin/SKILL.md`. It is a self-contained instruction file.
 
-Trigger with *"Postgres health check"*, *"bloat audit"*, or *"why is my DB slow"*.
+Trigger it with *"Postgres health check"*, *"bloat audit"*, or *"why is my DB slow"*.
 
 ## How an agent uses it
 
@@ -54,11 +54,11 @@ Trigger with *"Postgres health check"*, *"bloat audit"*, or *"why is my DB slow"
 12. synthesise                  → severity-ranked findings, each citing a catalog row
 ```
 
-Contracts the agent must not break: read-only, every number sourced from a query, no `EXPLAIN ANALYZE` against production without confirmation.
+The agent must keep three contracts: stay read-only, source every number from a query result, and never run `EXPLAIN ANALYZE` against production without confirmation.
 
 ## Database connection
 
-pglens enforces read-only at the protocol layer. Use a dedicated `pg_monitor` role:
+pglens enforces read-only access at the protocol layer. Use a dedicated `pg_monitor` role:
 
 ```sql
 CREATE USER marvin_ro WITH PASSWORD '...';
@@ -67,11 +67,11 @@ GRANT pg_monitor TO marvin_ro;     -- covers pg_stat_*, pg_ls_waldir(), pg_stat_
 GRANT USAGE ON SCHEMA public TO marvin_ro;
 ```
 
-Azure Flexible Server: same role for app-database phases. Phase 5a additionally reads `azure_sys.query_store.*` (covered by `azure_pg_admin`).
+On Azure Flexible Server the same role covers the app-database phases. Phase 5a also reads `azure_sys.query_store.*`, which `azure_pg_admin` covers.
 
-Session GUCs the agent sets: `statement_timeout = '30s'` (60s for Phase 2), `lock_timeout = '2s'`, `idle_in_transaction_session_timeout = '60s'`.
+The agent sets these session GUCs: `statement_timeout = '30s'` (60s for Phase 2), `lock_timeout = '2s'`, `idle_in_transaction_session_timeout = '60s'`.
 
-If pglens is unreachable, marvin falls back to **user-mediated mode**: it prints queries; the user runs and pastes results back.
+If pglens is unreachable, marvin falls back to user-mediated mode. It prints the queries, and you run them and paste the results back.
 
 ## Phases
 
@@ -88,23 +88,23 @@ If pglens is unreachable, marvin falls back to **user-mediated mode**: it prints
 | 7  | Replication (physical lag, xmin horizon, logical slots, subscriptions, conflicts) | `07-replication.sql` |
 | 8  | Config & capacity (drift, `pg_stat_database` counters, connections, sequences, lock table) | `08-config-and-capacity.sql` |
 
-**Not yet shipped:** structured synthesis template, GIN pending-list / BRIN summarisation checks, low-cardinality index detection, PG19.
+Not yet shipped: structured synthesis template, GIN pending-list and BRIN summarisation checks, low-cardinality index detection, PG19.
 
 ## How it works
 
-**Bloat math.** Pgexperts statistics-based estimate, not `n_dead_tup`. For borderline cases marvin recommends `pgstattuple_approx`. See `skills/marvin/references/interpretation-thresholds.md` for the rationale.
+Bloat math uses the pgexperts statistics-based estimate, not `n_dead_tup`. For borderline cases marvin recommends `pgstattuple_approx`. The rationale is in `skills/marvin/references/interpretation-thresholds.md`.
 
-**Version branching.** PG16+ hard floor, PG18 supported. `1b`, `5b`, `5k`, `3c-progress` ship in `[PG16]` and `[PG17+]` variants (PG17 renamed `blk_*_time` and moved checkpoint stats). `3f`, `5i2`, `7e [PG18]` are PG18-only blocks (new columns). Everything else is single-variant; PG18-only GUCs are read via `pg_settings` so they simply return no row on older majors. PG19 (beta) is not targeted yet.
+Version branching starts at PG16, the hard floor, and goes up to PG18. Blocks `1b`, `5b`, `5k`, and `3c-progress` ship in `[PG16]` and `[PG17+]` variants, because PG17 renamed `blk_*_time` and moved the checkpoint stats. Blocks `3f`, `5i2`, and `7e [PG18]` rely on new PG18 columns and run only there. Everything else is single-variant. PG18-only GUCs are read through `pg_settings`, so on older majors they return no row. PG19 (beta) is not targeted yet.
 
-**Replica-aware.** `pg_is_in_recovery()` is checked first. No `VACUUM`, no `CREATE INDEX`, no `pg_terminate_backend` against a hot standby.
+Replicas are detected up front with `pg_is_in_recovery()`. marvin never proposes `VACUUM`, `CREATE INDEX`, or `pg_terminate_backend` on a hot standby.
 
-**Asset format.** Each `assets/NN-*.sql` is a labelled catalogue: `-- ===` block headers, one SELECT per block, runnable through pglens's `query` tool or any SQL client. No psql meta.
+Each `assets/NN-*.sql` file is a labelled catalogue with `-- ===` block headers and one SELECT per block. The blocks run through pglens's `query` tool or any SQL client, with no psql meta-commands.
 
 ## Recommended extensions
 
 | Extension | Phase | Why |
 |---|---|---|
-| `pg_stat_statements` | 5-2, 5a–5e, 5b2 | Required for cumulative query stats; `5-2` checks eviction (`dealloc`) first |
+| `pg_stat_statements` | 5-2, 5a-5e, 5b2 | Required for cumulative query stats; `5-2` checks eviction (`dealloc`) first |
 | `pgstattuple` | 2 follow-up | Exact bloat when the estimate is borderline |
 | `pg_repack` | remediation | Online table rewrite |
 | `auto_explain` | plan capture | Slow-query plans logged automatically |
@@ -136,11 +136,11 @@ marvin/
 
 ## Limitations
 
-- PG16+ only.
+- PG16 and newer only.
 - Read-only. No automatic fixes.
-- Not a monitoring replacement (no historical trending).
-- Single-database run per session (cluster-wide risks surface; per-DB phases hit the connected DB).
-- Doesn't profile individual queries. Paste `EXPLAIN (ANALYZE, BUFFERS)` output back.
+- Not a monitoring replacement. There is no historical trending.
+- One database per session. Cluster-wide risks still show up, but the per-database phases only see the connected database.
+- Does not profile individual queries. Paste `EXPLAIN (ANALYZE, BUFFERS)` output back to the agent.
 
 ## License
 
