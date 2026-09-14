@@ -19,10 +19,22 @@ WHERE extname = 'pg_stat_statements';
 
 
 -- ============================================================================
--- 5-2  pg_stat_statements freshness. Interpret 5a–5e against stats_age.
+-- 5-2  pg_stat_statements freshness + eviction. Interpret 5a–5e against
+-- stats_age. dealloc > 0 = pg_stat_statements.max was hit and the least-
+-- executed entries were evicted → top-N rankings are biased toward
+-- survivors (docs). pganalyze: ~100 deallocs / 10 min is concerning; raise
+-- pg_stat_statements.max (default 5000; 10000 is a sane start, restart
+-- required). track_utility = on inflates entries with DDL/SET noise.
 -- ============================================================================
-SELECT stats_reset, now() - stats_reset AS stats_age
-FROM pg_stat_statements_info;
+SELECT
+  (SELECT dealloc     FROM pg_stat_statements_info)                 AS dealloc,
+  (SELECT stats_reset FROM pg_stat_statements_info)                 AS stats_reset,
+  (SELECT now() - stats_reset FROM pg_stat_statements_info)         AS stats_age,
+  (SELECT count(*) FROM pg_stat_statements)                         AS entries,
+  (SELECT setting FROM pg_settings WHERE name = 'pg_stat_statements.max')            AS pgss_max,
+  (SELECT setting FROM pg_settings WHERE name = 'pg_stat_statements.track')          AS track,
+  (SELECT setting FROM pg_settings WHERE name = 'pg_stat_statements.track_utility')  AS track_utility,
+  (SELECT setting FROM pg_settings WHERE name = 'pg_stat_statements.track_planning') AS track_planning;
 
 
 -- ============================================================================
@@ -110,6 +122,25 @@ FROM pg_stat_statements
 WHERE wal_bytes > 0
 ORDER BY wal_bytes DESC
 LIMIT 15;
+
+
+-- ============================================================================
+-- 5b3  Cluster WAL profile (pg_stat_wal, all versions; not pgss-gated).
+-- wal_buffers_full > 0 and growing → wal_buffers too small (default -1 =
+-- 1/32 of shared_buffers, capped 16 MB). fpi_pct_of_records high + 5k
+-- req_pct high = short checkpoints inflating full-page images (Percona):
+-- raise checkpoint_timeout / max_wal_size before touching wal_compression.
+-- PG18 removed wal_write/wal_sync/*_time from this view → WAL I/O is 5i2.
+-- ============================================================================
+SELECT
+  wal_records, wal_fpi,
+  pg_size_pretty(wal_bytes)                                AS wal_size,
+  round(100.0 * wal_fpi / NULLIF(wal_records, 0), 1)       AS fpi_pct_of_records,
+  wal_buffers_full,
+  current_setting('wal_buffers')                           AS wal_buffers,
+  current_setting('wal_compression')                       AS wal_compression,
+  stats_reset, now() - stats_reset                         AS stats_age
+FROM pg_stat_wal;
 
 
 -- ============================================================================
@@ -246,14 +277,41 @@ LIMIT 15;
 
 -- ============================================================================
 -- 5i  pg_stat_io — I/O by backend type + context (normal/vacuum/bulk*).
+-- PG18 adds object = 'wal' rows (and read_bytes/write_bytes/extend_bytes;
+-- op_bytes is gone). WAL is excluded here so the ranking means the same on
+-- every major; WAL I/O has its own block, 5i2.
 -- ============================================================================
 SELECT
   backend_type, object, context,
   reads, writes, extends, hits, evictions, fsyncs
 FROM pg_stat_io
 WHERE (reads > 0 OR writes > 0 OR extends > 0)
+  AND object <> 'wal'
 ORDER BY (COALESCE(reads,0) + COALESCE(writes,0) + COALESCE(extends,0)) DESC
 LIMIT 30;
+
+
+-- ============================================================================
+-- 5i2 [PG18]  WAL I/O by backend (pg_stat_io WHERE object = 'wal'). Use when
+-- pg18_plus = true. Timing columns are 0 unless track_wal_io_timing = on.
+-- 'client backend' doing most WAL writes/fsyncs = backends flushing WAL
+-- themselves at commit (wal_writer not keeping up, or synchronous_commit
+-- with tiny transactions). avg_fsync_ms > 5 on SSD = storage latency.
+-- ============================================================================
+SELECT
+  backend_type, context,
+  writes, pg_size_pretty(write_bytes)              AS written,
+  round(write_time::numeric, 0)                    AS write_ms,
+  fsyncs, round(fsync_time::numeric, 0)            AS fsync_ms,
+  CASE WHEN fsyncs > 0
+       THEN round((fsync_time / fsyncs)::numeric, 2) END AS avg_fsync_ms,
+  reads, pg_size_pretty(read_bytes)                AS read,
+  round(read_time::numeric, 0)                     AS read_ms,
+  current_setting('track_wal_io_timing')           AS track_wal_io_timing
+FROM pg_stat_io
+WHERE object = 'wal'
+  AND (writes > 0 OR reads > 0 OR fsyncs > 0)
+ORDER BY writes DESC;
 
 
 -- ============================================================================
@@ -308,6 +366,10 @@ FROM pg_stat_bgwriter;
 -- 5k [PG17+]  Checkpoint pressure (pg_stat_checkpointer). Use when
 -- pg17_plus = true — checkpoint columns left pg_stat_bgwriter in PG17.
 -- Same req_pct > 30 → raise max_wal_size. restartpoints_* nonzero on replicas.
+-- Pair with checkpoint_timeout (8b): still 300 s + req_pct > 30 → raise it
+-- too (Percona: 30 min is routine in production). PG18 adds num_done
+-- (checkpoints actually performed — requested ones can be skipped) and
+-- slru_written; select them by hand when pg18_plus = true.
 -- ============================================================================
 SELECT
   num_timed,

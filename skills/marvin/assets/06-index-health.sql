@@ -3,14 +3,20 @@
 -- the same safety filters (excludes unique / PK / constraint-backing).
 
 -- ============================================================================
--- 6a  Unused indexes. Trust requires stats_reset > 7d. Per-replica stats vary.
--- Partial / quarterly-used indexes may show idx_scan = 0 — cross-check
--- last_idx_scan (PG16+ timestamp survives stats resets).
+-- 6a  Unused indexes. Trust requires stats age >= 30 d (0-stats-age;
+-- pganalyze uses 35 d, postgres.ai 1 month) AND a look at every replica —
+-- idx_scan is per-instance. Partial / quarterly-used indexes may show
+-- idx_scan = 0 — cross-check last_idx_scan (PG16+, survives stats resets).
+-- Excluded: unique, PK, constraint-backing, invalid (6e owns those), and
+-- indexes whose leading columns match a FOREIGN KEY on the same table —
+-- those serve cascade DELETE/UPDATE on the parent, rarely show scans, and
+-- dropping them recreates finding 6d. (pg_constraint.conindid for a FK
+-- points at the *referenced* table's index, so the old filter missed them.)
 -- ============================================================================
 SELECT
   s.schemaname, s.relname           AS table_name,
   s.indexrelname                    AS index_name,
-  s.idx_scan,
+  s.idx_scan, s.last_idx_scan,
   pg_size_pretty(pg_relation_size(s.indexrelid)) AS index_size,
   pg_size_pretty(pg_relation_size(s.relid))      AS table_size
 FROM pg_stat_user_indexes s
@@ -18,8 +24,18 @@ JOIN pg_index i ON s.indexrelid = i.indexrelid
 WHERE s.idx_scan = 0
   AND NOT i.indisunique
   AND NOT i.indisprimary
+  AND i.indisvalid
   AND NOT EXISTS (
     SELECT 1 FROM pg_constraint c WHERE c.conindid = s.indexrelid
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint fk
+    WHERE fk.contype = 'f'
+      AND fk.conrelid = i.indrelid
+      AND array_length(fk.conkey, 1) <= i.indnkeyatts
+      AND (string_to_array(i.indkey::text, ' ')::int[])[1:array_length(fk.conkey, 1)]
+          = fk.conkey::int[]
   )
 ORDER BY pg_relation_size(s.indexrelid) DESC;
 
@@ -52,19 +68,24 @@ ORDER BY sum(bytes) DESC;
 -- 6c  Prefix-redundant: (a) is redundant if (a,b) exists with same predicate
 -- + opclasses. Unique excluded (uniqueness can be a 1-col property). Slice
 -- at indnkeyatts to drop INCLUDE columns (don't satisfy key-search). indkey
--- is int2vector (0-based) — convert to 1-based int[] for SQL slicing.
+-- is int2vector (0-based) — indkey::text → string_to_array gives a 1-based
+-- int[] (int2vectorout() returns cstring and does not cast implicitly).
+-- PG18 skip scan is the reverse case ((a,b) serving WHERE b = ? when a has
+-- few distinct values); it does NOT make (a) redundant and this rule stands.
+-- Expression columns appear as 0 in indkey — two different expression
+-- indexes would look identical, so indexprs must match too (same as 6b).
 -- ============================================================================
 WITH idx AS (
   SELECT
     indexrelid::regclass                                                AS idx_name,
     indrelid                                                            AS table_oid,
     indrelid::regclass                                                  AS table_name,
-    (pg_catalog.string_to_array(pg_catalog.int2vectorout(indkey),' '))::int[]
-                                                                        AS keycols_full,
+    string_to_array(indkey::text, ' ')::int[]                           AS keycols_full,
     indnkeyatts,
     indclass::oid[]                                                     AS keyops,
     pg_relation_size(indexrelid)                                        AS bytes,
     COALESCE(indpred::text, '')                                         AS pred,
+    COALESCE(indexprs::text, '')                                        AS expr,
     indisunique
   FROM pg_index
   WHERE indislive
@@ -74,7 +95,7 @@ idx_keys AS (
     idx_name, table_oid, table_name,
     keycols_full[1:indnkeyatts] AS keycols,
     keyops[1:indnkeyatts]       AS keyops,
-    bytes, pred, indisunique
+    bytes, pred, expr, indisunique
   FROM idx
 )
 SELECT
@@ -87,8 +108,10 @@ JOIN idx_keys big
   ON small.table_oid = big.table_oid
  AND small.idx_name <> big.idx_name
  AND small.pred     = big.pred
+ AND small.expr     = big.expr
  AND NOT small.indisunique
- AND array_length(small.keycols, 1) <= array_length(big.keycols, 1)
+ -- strict prefix: equal-length identical keys are duplicates → 6b, not here
+ AND array_length(small.keycols, 1) < array_length(big.keycols, 1)
  AND small.keycols  = big.keycols[1:array_length(small.keycols,1)]
  AND small.keyops   = big.keyops[1:array_length(small.keycols,1)]
 ORDER BY small.bytes DESC;
@@ -110,15 +133,12 @@ JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = x.attnum
 WHERE c.contype = 'f'
   AND NOT EXISTS (
     SELECT 1
-    FROM pg_index i,
-         LATERAL (
-           SELECT (pg_catalog.string_to_array(
-                     pg_catalog.int2vectorout(i.indkey), ' '))::int[] AS k
-         ) AS conv
+    FROM pg_index i
     WHERE i.indrelid = c.conrelid
       AND i.indislive
       AND array_length(c.conkey, 1) <= i.indnkeyatts
-      AND conv.k[1:array_length(c.conkey, 1)] = c.conkey::int[]
+      AND (string_to_array(i.indkey::text, ' ')::int[])[1:array_length(c.conkey, 1)]
+          = c.conkey::int[]
   )
 GROUP BY c.oid, c.conrelid, c.conname
 ORDER BY pg_relation_size(c.conrelid) DESC;
