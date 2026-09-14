@@ -5,8 +5,10 @@
 -- ratio is vacuum lag, NOT bloat — see references/interpretation-thresholds.md.
 
 -- ============================================================================
--- 2a  Table bloat (> 100 MB). is_na = skip the row.
--- Cross-check last_analyze (2a-stats below) — stale stats → unreliable.
+-- 2a  Table bloat (> 100 MB). is_na = skip the row; stale stats (2a-stats) =
+-- unreliable. severity: bloat_pct > 20 AND bloat_size > 1 GB → HIGH, > 100 MB
+-- → MEDIUM. Borderline → propose pgstattuple_approx('schema.table'); never
+-- run pgstattuple() (full scan + share lock) without confirmation.
 -- ============================================================================
 SELECT
   current_database()                                            AS db,
@@ -24,7 +26,12 @@ SELECT
        THEN round((100 * (tblpages - est_tblpages_ff) / tblpages::float)::numeric, 1)
        ELSE 0
   END                                                           AS bloat_pct,
-  is_na
+  is_na,
+  CASE WHEN tblpages > 0 AND 100 * (tblpages - est_tblpages_ff) / tblpages::float > 20
+        AND (tblpages - est_tblpages_ff) * bs > 1024::bigint^3        THEN 'HIGH'
+       WHEN tblpages > 0 AND 100 * (tblpages - est_tblpages_ff) / tblpages::float > 20
+        AND (tblpages - est_tblpages_ff) * bs > 100 * 1024 * 1024     THEN 'MEDIUM'
+  END                                                           AS severity
 FROM (
   SELECT
     ceil( reltuples / ( (bs - page_hdr) / tpl_size ) ) + ceil( toasttuples / 4 ) AS est_tblpages,
@@ -93,6 +100,9 @@ LIMIT 25;
 
 -- ============================================================================
 -- 2b  B-tree index bloat (> 50 MB). GIN/GiST/BRIN/HASH/SP-GiST not covered.
+-- severity: bloat_pct > 50 AND bloat_size > 1 GB → MEDIUM, > 100 MB → LOW.
+-- Never HIGH on the estimate alone (Cybertec: ~70% is normal for B-trees);
+-- rebuild on low AND falling pgstatindex().avg_leaf_density.
 -- ============================================================================
 SELECT
   current_database()                                                   AS db,
@@ -111,7 +121,12 @@ SELECT
        THEN round((100 * (relpages - est_pages_ff) / relpages::float)::numeric, 1)
        ELSE 0
   END                                                                  AS bloat_pct,
-  is_na
+  is_na,
+  CASE WHEN relpages > 0 AND 100 * (relpages - est_pages_ff) / relpages::float > 50
+        AND bs * (relpages - est_pages_ff) > 1024::bigint^3           THEN 'MEDIUM'
+       WHEN relpages > 0 AND 100 * (relpages - est_pages_ff) / relpages::float > 50
+        AND bs * (relpages - est_pages_ff) > 100 * 1024 * 1024        THEN 'LOW'
+  END                                                                  AS severity
 FROM (
   SELECT
     coalesce(1 +
@@ -177,13 +192,3 @@ WHERE NOT is_na
   AND relpages * (current_setting('block_size')::numeric) > 50 * 1024 * 1024
 ORDER BY GREATEST(bs * (relpages - est_pages_ff), 0) DESC NULLS LAST
 LIMIT 25;
-
-
--- ============================================================================
--- 2c  pgstattuple present? Borderline rows → propose (do not run):
---   SELECT * FROM pgstattuple_approx('schema.table');   -- sampled
---   SELECT * FROM pgstattuple('schema.table');          -- full scan + share lock
--- ============================================================================
-SELECT extname, extversion
-FROM pg_extension
-WHERE extname = 'pgstattuple';
